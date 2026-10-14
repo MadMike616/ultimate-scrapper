@@ -1,0 +1,3 @@
+#pragma once
+inline constexpr char DefaultConfig[] = R"toml(@ULTIMATE_SCRAPPER_DEFAULT_TOML@)toml";
+
