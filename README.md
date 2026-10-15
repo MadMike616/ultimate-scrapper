@@ -1,66 +1,192 @@
 # Ultimate Scrapper
 
-Ultimate Scrapper is a standalone D2RLoader client plugin with a Horadric Cube transmutation. Place the configured number of matching input items in the cube and press Transmute.
+Ultimate Scrapper adds configurable Horadric Cube recipes to D2RLoader. Put the required input items in the cube and use the configured transmute button.
 
-Choose an active output mode in `d2rloader/config/ultimate-scrapper.toml` under the active mod. Changes take effect after restarting D2R.
+Edit the active mod's **d2rloader/config/ultimate-scrapper.toml** to change settings. Restart D2R for TOML changes to take effect.
 
 ## Default behavior
 
-With the shipped TOML unchanged, Ultimate Scrapper behaves like Unique/Set Scrapper: it accepts exactly one Unique or Set item by itself and transmutes it into 0, 1, 2, or 3 random runes using the same default failure chance, output-count odds, and rune weights. The default output mode is `Runes`, and batch scrapping is off. Ultimate Scrapper adds optional input rules, Custom and Both output modes, batch scrapping, and button-routing settings; these only change behavior when the user chooses to edit the TOML.
+With the shipped TOML unchanged, Ultimate Scrapper behaves like Unique/Set Scrapper:
 
-The Horadric Cube and stash panels can show a **Batch scrap** checkbox, unchecked each time the plugin starts. Set `batch-scrap-always-on = true` in the root `[ultimate-scrapper]` table to keep batch processing on and omit the checkbox and label from the panels; this takes precedence over `show-batch-checkboxes`. It defaults to `false`. When it is false, `show-batch-checkboxes = false` hides the controls from the active layouts while retaining existing widgets in saved Native/Separate variants, so setting it back to `true` restores them at their saved positions. When batch processing is on, the plugin can process several cube items in one click if every item matches a configured one-item input rule. Each item gets its own output-mode, failure, output-count, and output-item rolls. Multi-item input recipes still run together as one recipe when the cube does not match a batch of one-item rules. The batch transaction consumes or creates all items together; if the output would exceed ItemService's capacity or the transaction cannot complete, all inputs are left untouched. The checkbox state applies to plugin recipes triggered from either panel.
+- Accepts one Unique or Set item.
+- Has a 30% chance to consume the item and produce nothing.
+- On success, produces 1 rune 70% of the time, 2 runes 25% of the time, or 3 runes 5% of the time.
+- Selects each rune independently from El through Zod, with weights that decrease by 20% per rune.
+- Starts in **Runes** mode, with batch scrapping off.
 
-## Inputs
+Custom inputs, Custom and Both modes, batch scrapping, and separate button routing are optional. They only change behavior when enabled in the TOML.
 
-The `[ultimate-scrapper.input]` settings apply to Runes, Custom, and Both modes. A flat `inputs` array describes one recipe and requires every listed item. Nested arrays describe OR alternatives, with each inner array forming a complete recipe; for example, `inputs = [["amu"], ["rin", "belt"]]` accepts one amulet or one ring and one belt. Each recipe's length sets its required input count, so no separate count setting is needed. All entries within a selected recipe must match distinct cube items. Use a 3- or 4-character item code for an exact base-item match, or prefix an itemtype code with `type:`, such as `"type:armo,normal"` for any normal armor. Itemtype codes contain 1 through 4 characters and match the active mod's item type hierarchy, including `Equiv1` and `Equiv2` parents. Type matching reads `itemtypes.txt`, `armor.txt`, `weapons.txt`, and `misc.txt` from the active mod's `data/global/excel` folder. Use `"any"` to match any item code, as in `"any,rare"` for any rare item. An entry without a quality accepts any quality; supported qualities are `inferior`, `normal`, `superior`, `magic`, `set`, `rare`, `unique`, and `crafted`. Set `inputs = [""]` to use the default recipe, which accepts exactly one Unique or Set item of any code. Each recipe must contain 1 through 12 valid entries; an invalid list disables the recipe until corrected. Any leftover `input-count` setting in an older config is ignored.
+## Input recipes
+
+The **[ultimate-scrapper.input]** settings apply to every output mode.
+
+A flat **inputs** array defines one recipe and requires every listed item. Nested arrays define alternatives: each inner array is a complete recipe. The number of entries in a recipe determines how many items it needs.
+
+~~~toml
+[ultimate-scrapper.input]
+inputs = ["amu"]
+
+# Or one amulet OR one ring and one belt
+# inputs = [["amu"], ["rin", "belt"]]
+
+# Or one normal armor item and one misc item
+# inputs = [["type:armo,normal", "type:misc"]]
+
+# Or the default: one Unique or Set item
+# inputs = [""]
+~~~
+
+Entries in one recipe must match distinct cube items. Each recipe must have 1–12 valid entries. An invalid input list disables input matching until it is corrected. Any **input-count** setting left over from an older config is ignored.
+
+### Matching items
+
+- **Item code:** Use the item's 3- or 4-character code, such as **amu**.
+- **Any item:** Use **any**. Add a quality to restrict it, such as **any,rare**.
+- **Item type:** Use **type:** followed by a 1–4-character itemtype code. For example, **type:armo,normal** matches normal armor.
+- **Quality:** Qualities are **inferior**, **normal**, **superior**, **magic**, **set**, **rare**, **unique**, and **crafted**. If omitted, any quality matches.
+
+Itemtype rules follow the active mod's itemtype hierarchy, including **Equiv1** and **Equiv2** parent types. They read **itemtypes.txt**, **armor.txt**, **weapons.txt**, and **misc.txt** from the active mod's **data/global/excel** folder.
+
+Set **inputs = [""]** to use the default recipe: exactly one Unique or Set item of any code.
 
 ## Output modes
 
+Set **active-output-mode** in the **[ultimate-scrapper]** section.
+
+| Mode | Behavior |
+| --- | --- |
+| **Runes** | Produces random runes using the failure chance, output-count odds, and rune weights in the root section. |
+| **Custom** | Selects outputs from the item pool in **[ultimate-scrapper.custom]**. |
+| **Both** | Chooses Runes or Custom with equal 50% odds for each transmute. The selected mode uses its own settings. |
+
+In Both mode, the mode is chosen before the failure roll.
+
 ### Runes
 
-`active-output-mode = "Runes"` preserves the original recipe: each transmutation has a 30% failure chance by default. On success it produces 1 rune with 70% probability, 2 runes with 25%, or 3 runes with 5%. Each rune is selected independently from El through Zod; rune weights step down 20% per rune by default and are normalized across all 33 runes. These settings remain in the root `[ultimate-scrapper]` table: `failure-chance-percent`, `output-count-weights`, and `rune-weights`.
+By default, each transmute has a 30% failure chance. On success, output counts are:
+
+| Rune count | Chance |
+| --- | ---: |
+| 1 | 70% |
+| 2 | 25% |
+| 3 | 5% |
+
+Each rune is rolled independently. The plugin normalizes the configured weights across all 33 runes. By default, each successive rune's weight is 20% lower than the previous rune's.
+
+Configure Runes in the root **[ultimate-scrapper]** section:
+
+- **failure-chance-percent**
+- **[ultimate-scrapper.output-count-weights]**
+- **[ultimate-scrapper.rune-weights]**
 
 ### Custom
 
-Set `active-output-mode = "Custom"` to use the separate `[ultimate-scrapper.custom]` settings. `failure-chance-percent` controls the chance that the input and its socket contents are consumed without output. `item-level` sets the level for every output, from 1 through 99. The nested `[ultimate-scrapper.custom.output-count-weights]` table controls how many random items are selected after a successful roll. Set the success-only weights for `one` through `twelve`; they must sum to 100. This allows up to 12 random outputs, in addition to any guaranteed outputs. The defaults preserve the previous behavior of always selecting one random item. Each output is selected independently from `[[ultimate-scrapper.custom.items]]`, so the same entry can be selected more than once. Set `guaranteed = true` on any item entry to add one copy of it to every successful recipe in addition to the random outputs. Guaranteed entries are excluded from random selection; their `weight` does not affect the random pool. Entries require a D2 item `code`; `quality` may be one supported name, a comma-separated list such as `"magic,rare"`, blank (`quality = ""`), or omitted. A list chooses uniformly from only its named qualities, excluding all others. A blank or omitted quality chooses uniformly from every quality valid for that item code, so a rune or gem resolves to Normal while jewelry, equipment, and other multi-quality items can roll among their eligible qualities. `quantity` defaults to the game's normal amount for the item.
+Custom mode uses settings in **[ultimate-scrapper.custom]**:
 
-Supported custom qualities are `inferior`, `normal`, `superior`, `magic`, `set`, `rare`, `unique`, and `crafted`. The blank-quality selection uses the active mod's item tables, available set and unique records, and enabled crafting recipes. Set and unique outputs use a random compatible game record. If the game cannot create and place every requested output, the transaction rolls back and leaves the input untouched.
+- **failure-chance-percent** sets the chance to consume the input and socket contents without producing output.
+- **item-level** sets the item level of every output, from 1 to 99.
+- **[ultimate-scrapper.custom.output-count-weights]** chooses 1–12 random outputs after a successful roll. The success-only weights for **one** through **twelve** must total 100%.
 
-### Both
+Every random output is selected independently from **[[ultimate-scrapper.custom.items]]**, so an entry may be selected more than once. The shipped weights always select one random item.
 
-Set `active-output-mode = "Both"` to choose between Runes and Custom with equal 50% probability on each transmute. The chosen mode uses its own failure chance and output settings. The mode is selected before the failure roll, so each attempt first chooses which mode's recipe settings to use.
+Each item entry requires a D2 item **code**. Its **quantity** defaults to the game's normal amount. The **weight** controls how often it is selected relative to other pool entries.
 
-The shipped TOML includes a sample custom output pool using item codes `r01`, `gpv`, and `amu`, each with equal weight and blank quality. Edit or replace those entries to configure your output pool. The plugin validates the active mode's settings during load and reports invalid settings in the D2RLoader log.
+#### Output quality
 
-## Behavior and compatibility
+Set **quality** to one quality or a comma-separated list, such as **magic,rare**. A list rolls uniformly among only the named qualities.
 
-`transmute-button-mode` selects button layout and routing. `"Native"` removes the plugin-owned button from the active layout, checks configured inputs when native Transmute is pressed, and passes unmatched contents to D2R for native `cubemain.txt` recipes. When both a plugin input and native recipe match, the plugin recipe takes priority. `"Separate"` keeps the plugin-owned button visible, always passes native Transmute clicks through (including recipe overlaps), and reserves the added button for plugin recipes. On first initialization, the plugin adds its button with default coordinates without replacing other widgets, text, styles, or layout fields. Later starts preserve the saved coordinates.
+If **quality** is blank or omitted, the plugin rolls among every quality valid for that item code. Items with only one valid quality, such as runes and gems, use that quality. Set and Unique outputs use a random compatible game record.
 
-On first load, the plugin copies the active mod's cube and stash layouts into per-install Native and Separate variants under `d2rloader/config/ultimate-scrapper-layouts/`. It leaves the Native variants without the plugin button and injects the Repair All button widget into the Separate variants. The Batch scrap checkbox is injected into both cube variants and both stash variants. Default checkbox positions are Native cube `(545, 1088)` and stash `(825, 1402)`, and Separate cube `(663, 1088)` and stash `(825, 1530)`. Its text label is a child of the checkbox, so changing the checkbox's `rect` coordinates moves both together; the label's own `rect` coordinates are offsets from the checkbox. Existing layout variants are migrated to this nested structure while preserving the label's current on-screen position. All other JSON content is preserved. The four files are named `horadriccubelayouthd.native.json`, `horadriccubelayouthd.separate.json`, `bankexpansionlayouthd.native.json`, and `bankexpansionlayouthd.separate.json`. Once those variants exist, the plugin does not reseed them from the active mod files or reset button coordinates. If a checkbox is missing when its layout is first initialized, it is added once to that layout's variants; separate markers prevent later reinjection if a user removes it. At startup it copies the selected mode's variants into the active mod's same-named layout files; this is how a changed Native/Separate setting takes effect. Edit the per-install variants to customize button positions and the label offset. Players can use the same active filenames while keeping their own contents and appearance; the repository's example layouts are not installed over their files. The plugin preserves a one-time `.ultimate-scrapper.bak` copy of each active layout as a recovery backup.
+Supported qualities are **inferior**, **normal**, **superior**, **magic**, **set**, **rare**, **unique**, and **crafted**. Quality selection uses the active mod's item tables, available Set and Unique records, and enabled crafting recipes.
 
-Accepted plugin actions perform the exchange as one D2RLoader `ItemService` transaction on the game thread. All rune and gem outputs are identified. Other outputs with the `misc` itemtype are identified except amulets, rings, quivers, charms, and torches. A failed recipe consumes the input and any socket contents. Quantity-bearing inputs are consumed at their full current quantity, removing the whole item. If the input changes before the transaction, or an output transaction fails, the input remains untouched. The plugin does not edit save files or `cubemain.txt` directly; D2R records successful outputs in the inventory normally.
+#### Guaranteed outputs
 
-This is a client plugin and requires an authoritative local game or TCP/IP host. Remote clients cannot perform the item transaction.
+Set **guaranteed = true** on an item entry to add one copy of it to every successful recipe. Guaranteed items are added in addition to the random outputs and are excluded from the random pool. Their weight has no effect.
+
+The sample TOML includes **r01**, **gpv**, and **amu** with equal weights and blank qualities. Edit or replace those entries to make your output pool. The plugin validates the active mode's settings at startup and reports invalid settings in the D2RLoader log.
+
+## Batch scrapping
+
+The cube and stash panels can show a **Batch scrap** checkbox. It starts unchecked each time the plugin starts. The checkbox controls plugin recipes from either panel.
+
+- Set **show-batch-checkboxes = false** to hide the checkbox and label. Their saved widgets remain in the layout variants, so setting it back to true restores them at their saved positions.
+- Set **batch-scrap-always-on = true** to keep batch processing enabled and hide the checkbox and label. This setting takes precedence over **show-batch-checkboxes**. It defaults to false.
+
+When batch scrapping is enabled, one click can process several cube items if every item matches a configured one-item recipe. Each item receives its own mode, failure, output-count, and output-item rolls.
+
+If the cube instead matches a multi-item recipe, the plugin processes that recipe as one transaction. If the transaction cannot complete or the outputs exceed ItemService's capacity, the inputs remain untouched.
+
+## Transmute buttons and layouts
+
+Set **transmute-button-mode** to **Native** or **Separate**.
+
+| Mode | Native Transmute button | Added plugin button |
+| --- | --- | --- |
+| **Native** | Checks for a plugin recipe first. If none matches, passes the contents to D2R for native recipes. A matching plugin recipe takes priority over an overlapping native recipe. | Hidden |
+| **Separate** | Always passes the click through to native D2R recipes, including when a plugin recipe also matches. | Handles plugin recipes only |
+
+In Separate mode, the added button uses the Repair All button widget. On first initialization, the plugin adds that widget and its initial coordinates while preserving the player's other layout content. Later starts keep the saved coordinates.
+
+### Layout setup
+
+On first load, the plugin copies the active cube and stash layouts into per-install Native and Separate variants under **d2rloader/config/ultimate-scrapper-layouts/**.
+
+- Native variants omit the plugin button; Separate variants include it.
+- The Batch scrap checkbox is added to both cube variants and both stash variants.
+- The checkbox label is nested under the checkbox, so moving the checkbox also moves the label. The label's coordinates are offsets from its parent.
+- Existing flat checkbox and label entries are migrated while preserving the label's on-screen position.
+- Other widgets, text, styles, and layout values are preserved.
+- A one-time **.ultimate-scrapper.bak** backup is kept for each active layout.
+
+The four per-install files are:
+
+- **horadriccubelayouthd.native.json**
+- **horadriccubelayouthd.separate.json**
+- **bankexpansionlayouthd.native.json**
+- **bankexpansionlayouthd.separate.json**
+
+The plugin copies the selected variants to the active layout filenames at startup. Once the variants exist, it does not reseed them or reset button positions. Edit the per-install variants to reposition the controls. The repository's example layouts under **assets/grailerrl-ui/** are for GrailerRL and are not copied over a player's layouts.
+
+Default checkbox positions:
+
+| Layout | Cube | Stash |
+| --- | --- | --- |
+| Native | (545, 1088) | (825, 1402) |
+| Separate | (663, 1088) | (825, 1530) |
+
+## Item handling
+
+Plugin actions run as one D2RLoader **ItemService** transaction on the game thread.
+
+- A failed recipe consumes its input and any socket contents.
+- Quantity-bearing inputs are consumed in full, removing the item rather than reducing its quantity by one.
+- Runes and gems are always identified.
+- Other outputs with the **misc** itemtype are identified, except amulets, rings, quivers, charms, and torches.
+- If an input changes before the transaction, or the game cannot create and place every output, the transaction leaves the input untouched.
+
+The plugin does not edit save files or **cubemain.txt**. Successful outputs are added to the inventory normally.
+
+Ultimate Scrapper requires an authoritative local game or TCP/IP host. Remote clients cannot perform the item transaction.
 
 ## Install
 
-Build the DLL and copy `d2rl-ultimate-scrapper.dll` to the active mod's `d2rloader/plugins/` directory. Restart D2R through D2RLoader. The plugin creates `ultimate-scrapper.toml` and per-install layout variants on first load. The JSON files under `assets/grailerrl-ui/` are example layouts for the GrailerRL setup; do not copy them over a player's existing layouts unless they specifically want those layouts.
+Place **d2rl-ultimate-scrapper.dll** in the active mod's **d2rloader/plugins/** folder, then restart D2R through D2RLoader.
+
+On first load, the plugin creates **ultimate-scrapper.toml** and the per-install layout variants if they do not already exist. Do not copy the example GrailerRL layouts over an existing layout unless you want to use those examples.
 
 ## Build
 
-Requires Windows x64, CMake 3.29 or newer, Visual Studio 2022 or newer with the Windows SDK, and D2RLoader PluginSDK ABI 4. CMake fetches the pinned SDK commit `6eb8f8b6192868214706bd6d528c5294f2f551b7` on the first configure. To use a local SDK checkout:
+Build requirements: Windows x64, CMake 3.29 or newer, Visual Studio 2022 or newer, and the Windows SDK. CMake fetches the pinned D2RLoader PluginSDK commit and TOML++ v3.4.0. To use a local PluginSDK checkout:
 
-```powershell
-cmake -S . -B ..\ultimate-scrapper-build -A x64 `
-  -DULTIMATE_SCRAPPER_LOCAL_SDK_DIR="<PluginSDK checkout>"
+~~~powershell
+cmake -S . -B ..\ultimate-scrapper-build -A x64 -DULTIMATE_SCRAPPER_LOCAL_SDK_DIR="<PluginSDK checkout>"
 cmake --build ..\ultimate-scrapper-build --config Release --target ultimate_scrapper
-```
+~~~
 
-The output is `../ultimate-scrapper-build/Release/d2rl-ultimate-scrapper.dll`. The build fetches TOML++ v3.4.0. Manual builds need the generated `default_config.hpp` from the CMake configure step and the TOML++ include directory in addition to the SDK.
+The DLL is written to **../ultimate-scrapper-build/Release/d2rl-ultimate-scrapper.dll**. Manual builds also need the generated **default_config.hpp** and TOML++ include directory.
 
-## Compatibility
+## Compatibility and license
 
-Targeted at Windows x64, D2R 3.3.93847, and D2RLoader 1.3.1-beta (PluginSDK ABI 4). The source is based on the established Unique/Set Scrapper implementation pattern; this separately identified build has not yet been verified in-game.
+Ultimate Scrapper targets Windows x64, D2R 3.3.93847, and D2RLoader 1.3.1-beta (PluginSDK ABI 4). This separately identified release build has not yet been reverified in-game.
 
-See `THIRD_PARTY_NOTICES.md` for notices covering TOML++ and D2RLoader PluginSDK. This project is licensed under the MIT License; see `LICENSE`.
-
+The project is licensed under the MIT License. See **LICENSE** and **THIRD_PARTY_NOTICES.md** for third-party notices for TOML++ and the D2RLoader PluginSDK.
