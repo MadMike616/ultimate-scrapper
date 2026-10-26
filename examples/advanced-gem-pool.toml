@@ -1,0 +1,197 @@
+# Input rules apply to Runes, Custom, and Both modes.
+[ultimate-scrapper.input]
+
+# A flat inputs array is one recipe and requires every listed item. Nested
+# arrays are OR alternatives; each inner list is a complete recipe. The number
+# of strings in a recipe sets the required input count; no separate count is needed.
+# Each recipe must contain 1 through 12 entries; invalid recipes disable
+# custom input matching until the list is corrected.
+# Each string is an item code, "any", or "type:<code>", optionally followed
+# by a comma and quality. Item codes use 3 or 4 characters; itemtype codes use
+# 1 through 4 characters from ItemTypes.txt and include Equiv1/2 parent types.
+# Type rules need itemtypes.txt, armor.txt, weapons.txt, and misc.txt in the
+# active mod's data/global/excel folder. Supported qualities: inferior, normal,
+# superior, magic, set, rare, unique, crafted. No quality means any quality is accepted.
+# The single-empty-string value inputs = [""] means one Unique or Set item.
+# Use code "any" to accept any item code, optionally with a quality:
+# inputs = ["any"]      # any item
+# inputs = ["any,rare"] # any rare item
+
+# Example: Default behavior, 1 Unique/Set Item
+# inputs = [""]
+# Example: one amulet:
+# inputs = ["amu"]
+# Example: one amulet AND one ring:
+# inputs = ["amu", "rin"]
+# Example: one amulet OR one ring:
+# inputs = [["amu"], ["rin"]]
+# Example: any rare item OR one amulet:
+# inputs = [["any,rare"], ["amu"]]
+# Example: one amulet OR one ring + one belt:
+# inputs = [["amu"], ["rin", "belt"]]
+# Example: normal armor + misc item OR magic ring + amulet:
+# inputs = [["type:armo,normal", "type:misc"], ["rin,magic", "amu"]]
+
+inputs = [""]
+
+[ultimate-scrapper]
+# Show or hide the Batch scrap checkbox and label in both panels.
+show-batch-checkboxes = true
+# Keep batch scrapping enabled and omit its checkbox and label from the panels.
+# This setting takes precedence over show-batch-checkboxes.
+batch-scrap-always-on = true
+
+# Active output mode: "Runes", "Custom", or "Both". Both chooses Runes or
+# Custom with equal probability for each transmute and uses that mode's settings.
+
+active-output-mode = "Runes"
+
+# Button routing: "Native" checks plugin inputs first when either Convert button
+# is pressed, then passes unmatched contents to D2R for native recipes. If both a
+# plugin input and native cubemain recipe match, the plugin recipe takes priority.
+# "Separate" passes native Transmute through and reserves the added button for
+# plugin recipes, even when a native recipe also matches.
+# On first startup, the plugin copies this player's active cube/stash JSON files
+# to Native and Separate variants under d2rloader/config/ultimate-scrapper-layouts.
+# The Native variants omit the plugin button; the Separate variants get the
+# button widget and its initial coordinates. Other JSON content is preserved.
+# Once variants exist, the plugin does not reseed them or reset coordinates.
+# Each startup it copies the selected mode's variants into the active layout
+# filenames. Edit the per-install variants to adjust button positions/layouts.
+# The repository's example layouts are not installed over a player's files.
+# Changes take effect after restarting D2R.
+transmute-button-mode = "Separate"
+
+# ===== Runes mode settings: start =====
+# Percent chance that the input item is consumed and no runes are produced.
+failure-chance-percent = 30
+
+[ultimate-scrapper.output-count-weights]
+# These are success-only percentages and must sum to 100.
+one = 70
+two = 25
+three = 5
+
+[ultimate-scrapper.rune-weights]
+# Relative weights; the plugin normalizes them. Defaults step down 20% per rune.
+el = 100.000000
+eld = 80.000000
+tir = 64.000000
+nef = 51.200000
+eth = 40.960000
+ith = 32.768000
+tal = 26.214400
+ral = 20.971520
+ort = 16.777216
+thul = 13.421773
+amn = 10.737418
+sol = 8.589935
+shael = 6.871948
+dol = 5.497558
+hel = 4.398047
+io = 3.518437
+lum = 2.814750
+ko = 2.251800
+fal = 1.801440
+lem = 1.441152
+pul = 1.152922
+um = 0.922337
+mal = 0.737870
+ist = 0.590296
+gul = 0.472237
+vex = 0.377789
+ohm = 0.302231
+lo = 0.241785
+sur = 0.193428
+ber = 0.154743
+jah = 0.123794
+cham = 0.099035
+zod = 0.079228
+
+# ===== Runes mode settings: end =====
+
+# ===== Custom mode settings: start =====
+[ultimate-scrapper.custom]
+# Custom mode consumes the input with this chance and produces no output.
+failure-chance-percent = 30
+
+# Item level applied to every custom output (1 through 99).
+item-level = 1
+
+[ultimate-scrapper.custom.output-count-weights]
+# These success-only percentages select 1 through 12 random outputs; they must sum to 100.
+# These defaults create one random item and no additional random items.
+one = 50
+two = 25
+three = 10
+four = 5
+five = 3
+six = 2
+seven = 2
+eight = 1
+nine = 1
+ten = 1
+eleven = 0
+twelve = 0
+
+# Each random output is selected independently from this list, using relative weights.
+# Duplicate selections are possible. Item codes can use 1 to 4 characters;
+# shorter codes are padded with spaces to the game's four-byte code field.
+# Special selectors are one weighted pool entry; when chosen, a member
+# is selected uniformly from that pool.
+#   code = "gem"              # all sizes, including skulls
+#   code = "gem:chipped"      # chipped gems and skulls only
+#   code = "rune"             # El through Zod
+#   code = "rune:r01-r10"     # El through Thul, inclusive
+# Gem sizes: chipped, flawed, normal, flawless, perfect.
+# Rune ranges are inclusive (r01 through r33). Selectors ignore case.
+# Quality can be inferior, normal, superior, magic, set, rare, unique,
+# or crafted. A list such as "magic,rare" chooses only those qualities.
+# Blank ("") or omitted quality randomly chooses from all valid qualities.
+# Set/unique quality uses a random compatible game record.
+# quantity defaults to the game's normal amount, and weight defaults to 1.
+# Set guaranteed = true to add one of this item to each successful recipe in
+# addition to random outputs; guaranteed entries are excluded from random
+# selection. Weight applies only to entries with guaranteed = false.
+# Set weight to 0 to exclude an entry from random selection.
+
+[[ultimate-scrapper.custom.items]]
+code = "gem:chipped"
+quality = ""
+weight = 5
+guaranteed = false
+
+[[ultimate-scrapper.custom.items]]
+code = "gem:flawed"
+quality = ""
+weight = 4
+guaranteed = false
+
+[[ultimate-scrapper.custom.items]]
+code = "gem:normal"
+quality = ""
+weight = 3
+guaranteed = false
+
+[[ultimate-scrapper.custom.items]]
+code = "gem:flawless"
+quality = ""
+weight = 2
+guaranteed = false
+
+[[ultimate-scrapper.custom.items]]
+code = "gem:perfect"
+quality = ""
+weight = 1
+guaranteed = false
+
+# You can add up to 64 different entries here
+
+#[[ultimate-scrapper.custom.items]]
+#code = ""
+#quality = ""
+#weight = 
+#guaranteed = 
+
+# ===== Custom mode settings: end =====
+

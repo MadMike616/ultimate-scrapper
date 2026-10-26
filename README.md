@@ -89,7 +89,33 @@ Custom mode uses settings in **[ultimate-scrapper.custom]**:
 
 Every random output is selected independently from **[[ultimate-scrapper.custom.items]]**, so an entry may be selected more than once. The shipped weights always select one random item.
 
-Each item entry requires a D2 item **code**. Its **quantity** defaults to the game's normal amount. The **weight** controls how often it is selected relative to other pool entries.
+Each item entry requires a D2 item **code** or a special selector. Its **quantity** defaults to the game's normal amount. The **weight** controls how often that entry is selected relative to other pool entries.
+
+#### Gem and rune selectors
+
+Selectors count as one entry for the configured **weight**. If a selector wins, the plugin makes a second, equal-chance roll among the eligible item codes in that selector:
+
+~~~toml
+[[ultimate-scrapper.custom.items]]
+code = "gem:chipped"
+quality = ""
+weight = 1
+guaranteed = false
+
+[[ultimate-scrapper.custom.items]]
+code = "rune:r01-r10"
+quality = ""
+weight = 1
+guaranteed = false
+~~~
+
+- **gem** includes all five sizes: chipped, flawed, normal, flawless, and perfect. It includes the seven standard types at each size, including skulls. A size suffix, such as **gem:chipped**, limits the pool to that size. The seven eligible codes within a size have equal odds.
+- **rune** includes all runes from El (**r01**) through Zod (**r33**). Use an inclusive range such as **rune:r01-r10** to limit the pool; a single rune such as **rune:r10** is also accepted. Runes within the selected range have equal odds.
+- Selector names and size names are case-insensitive. The **quality** field applies to whichever code the selector chooses. Blank quality uses the item's valid quality; gems and runes use Normal quality.
+
+#### Full configuration example
+
+**examples/advanced-gem-pool.toml** is a complete example with weighted gem-size pools, always-on batch scrapping, and Separate button routing. It leaves Runes active by default; change **active-output-mode** to **Custom** or **Both** to use its gem pool. Copy settings you want into the active mod's TOML.
 
 #### Output quality
 
@@ -145,7 +171,7 @@ The four per-install files are:
 - **bankexpansionlayouthd.native.json**
 - **bankexpansionlayouthd.separate.json**
 
-The plugin copies the selected variants to the active layout filenames at startup. Once the variants exist, it does not reseed them or reset button positions. Edit the per-install variants to reposition the controls. The repository's example layouts under **assets/grailerrl-ui/** are for GrailerRL and are not copied over a player's layouts.
+The plugin copies the selected variants to the active layout filenames at startup. Once the variants exist, it does not reseed them or reset button positions. Edit the per-install variants to reposition the controls. Optional layout examples are under **assets/layout-examples/**; they are never copied over an active mod's layouts.
 
 Default checkbox positions:
 
@@ -172,7 +198,7 @@ Ultimate Scrapper requires an authoritative local game or TCP/IP host. Remote cl
 
 Place **d2rl-ultimate-scrapper.dll** in the active mod's **d2rloader/plugins/** folder, then restart D2R through D2RLoader.
 
-On first load, the plugin creates **ultimate-scrapper.toml** and the per-install layout variants if they do not already exist. Do not copy the example GrailerRL layouts over an existing layout unless you want to use those examples.
+On first load, the plugin creates **ultimate-scrapper.toml** and the per-install layout variants if they do not already exist. The optional layout examples may need adjustments for a mod's own UI and are not installed automatically.
 
 ## Build
 
@@ -187,6 +213,7 @@ The DLL is written to **../ultimate-scrapper-build/Release/d2rl-ultimate-scrappe
 
 ## Compatibility and license
 
-Ultimate Scrapper targets Windows x64, D2R 3.3.93847, and D2RLoader 1.3.1-beta (PluginSDK ABI 4). This separately identified release build has not yet been reverified in-game.
+Ultimate Scrapper targets Windows x64, D2R 3.3.93847, and D2RLoader 1.3.1-beta (PluginSDK ABI 4). Version 0.2.0 adds weighted gem and rune selectors for Custom mode.
 
 The project is licensed under the MIT License. See **LICENSE** and **THIRD_PARTY_NOTICES.md** for third-party notices for TOML++ and the D2RLoader PluginSDK.
+

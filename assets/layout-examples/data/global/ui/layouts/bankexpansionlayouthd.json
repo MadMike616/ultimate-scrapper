@@ -50,7 +50,7 @@
 				"inactiveFrames": [ 0, 0, 0 ],
 				"activeFrames": [ 1, 1, 1 ],
 				"disabledFrames": [-1, 0, 0 ],
-				"textStrings": [ "@personal", "@shared", "Craft"],
+				"textStrings": [ "@personal", "@shared", "@craft"],
 				"textStyle": { "pointSize": "$SmallPanelFontSize" },
 				"activeTextColor": "$TabsActiveTextColor",
 				"inactiveTextColor": "$TabsInactiveTextColor",

@@ -140,6 +140,14 @@ twelve = 0
 # Each random output is selected independently from this list, using relative weights.
 # Duplicate selections are possible. Item codes can use 1 to 4 characters;
 # shorter codes are padded with spaces to the game's four-byte code field.
+# Special selectors can be used as one weighted pool entry:
+#   code = "gem"                 # all gem sizes and skulls, equal chance
+#   code = "gem:chipped"         # all chipped gems and skulls, equal chance
+#   code = "rune"                # all runes from El through Zod, equal chance
+#   code = "rune:r01-r10"        # El through Thul, inclusive, equal chance
+# After a selector is chosen, one eligible item is selected uniformly.
+# Gem sizes: chipped, flawed, normal, flawless, perfect. Rune ranges are
+# inclusive and use r01 through r33. Selector names are case-insensitive.
 # Quality can be inferior, normal, superior, magic, set, rare, unique,
 # or crafted. A list such as "magic,rare" chooses only those qualities.
 # Blank ("") or omitted quality randomly chooses from all valid qualities.
@@ -168,7 +176,8 @@ quality = ""
 weight = 1
 guaranteed = false
 
-# You can add up to 64 different entries here
+# You can add up to 64 different entries here. For example, use code = "gem"
+# or code = "rune:r01-r10" to include a complete weighted pool as one entry.
 
 #[[ultimate-scrapper.custom.items]]
 #code = ""

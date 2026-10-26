@@ -42,6 +42,10 @@ constexpr std::size_t MaximumItemRows = 16384;
 constexpr std::size_t MaximumCustomPoolEntries = 64;
 constexpr std::size_t MaximumItemQualities = 8;
 constexpr std::uint32_t RuneCount = 33;
+constexpr std::size_t GemSizeCount = 5;
+constexpr std::size_t GemsPerSize = 7;
+constexpr std::size_t MaximumSelectorCodes = GemSizeCount * GemsPerSize;
+constexpr std::size_t MaximumCustomOutputCodeLength = 32;
 constexpr std::uint32_t MaximumRuneOutputs = 3;
 constexpr std::uint32_t MaximumCustomRandomOutputs = 12;
 constexpr std::size_t MaximumCustomOutputs = D2RL::Items::MaxTransactionOutputs;
@@ -53,6 +57,17 @@ constexpr std::array<std::string_view, RuneCount> RuneNames{
     "fal", "lem", "pul", "um", "mal", "ist", "gul", "vex", "ohm",
     "lo", "sur", "ber", "jah", "cham", "zod",
 };
+constexpr std::array<std::string_view, GemSizeCount> GemSizeNames{
+    "chipped", "flawed", "normal", "flawless", "perfect",
+};
+constexpr std::array<std::array<std::string_view, GemsPerSize>, GemSizeCount>
+    GemCodes{{
+        {"gcv", "gcy", "gcb", "gcg", "gcr", "gcw", "skc"},
+        {"gfv", "gfy", "gfb", "gfg", "gfr", "gfw", "skf"},
+        {"gsv", "gsy", "gsb", "gsg", "gsr", "gsw", "sku"},
+        {"gzv", "gly", "glb", "glg", "glr", "glw", "skl"},
+        {"gpv", "gpy", "gpb", "gpg", "gpr", "gpw", "skz"},
+    }};
 
 auto MakeDefaultRuneWeights() -> std::array<double, RuneCount> {
     std::array<double, RuneCount> weights{};
@@ -84,6 +99,8 @@ enum class TransmuteButtonMode {
 
 struct CustomOutputEntry {
     std::uint32_t code{};
+    std::array<std::uint32_t, MaximumSelectorCodes> selectorCodes{};
+    std::size_t selectorCodeCount{};
     std::array<D2RL::Items::Quality, MaximumItemQualities> qualities{};
     std::size_t qualityCount{};
     std::uint32_t quantity{D2RL::Items::DefaultValue};
@@ -179,7 +196,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion = D2RL_PLUGIN_API_VERSION,
     .id = PluginId,
     .name = "Ultimate Scrapper",
-    .version = "0.1.0",
+    .version = "0.2.0",
     .author = "MadMike",
     .description = "Transmutes configured input items into runes or configurable custom items.",
     .flags = D2RL::PluginFlags::Client,
@@ -441,7 +458,15 @@ auto ChooseCustomItemIndex() noexcept -> std::size_t {
         Config.custom.totalWeight, [](std::size_t index) noexcept {
             const CustomOutputEntry& entry = Config.custom.items[index];
             return entry.guaranteed ? 0.0 : entry.weight;
-        });
+    });
+}
+
+auto ChooseCustomOutputCode(const CustomOutputEntry& entry) noexcept
+        -> std::uint32_t {
+    if (entry.selectorCodeCount == 0) return entry.code;
+    const std::size_t index = std::uniform_int_distribution<std::size_t>(
+        0, entry.selectorCodeCount - 1)(RandomEngine);
+    return entry.selectorCodes[index];
 }
 
 auto ChooseRandomQuality(std::uint32_t itemCode) noexcept
@@ -456,9 +481,10 @@ auto ChooseRandomQuality(std::uint32_t itemCode) noexcept
     return found->second[index];
 }
 
-auto ChooseCustomOutputQuality(const CustomOutputEntry& entry) noexcept
+auto ChooseCustomOutputQuality(const CustomOutputEntry& entry,
+        std::uint32_t itemCode) noexcept
         -> D2RL::Items::Quality {
-    if (entry.randomQuality) return ChooseRandomQuality(entry.code);
+    if (entry.randomQuality) return ChooseRandomQuality(itemCode);
     if (entry.qualityCount == 0) return D2RL::Items::Quality::Normal;
     const std::size_t index = std::uniform_int_distribution<std::size_t>(
         0, entry.qualityCount - 1)(RandomEngine);
@@ -552,15 +578,17 @@ auto AppendCustomOutputs(
     for (std::size_t index = 0; index < Config.custom.itemCount; ++index) {
         const CustomOutputEntry& entry = Config.custom.items[index];
         if (!entry.guaranteed) continue;
-        const auto quality = ChooseCustomOutputQuality(entry);
-        outputs[outputCount++] = MakeOutputSpec(entry.code, quality,
+        const std::uint32_t code = ChooseCustomOutputCode(entry);
+        const auto quality = ChooseCustomOutputQuality(entry, code);
+        outputs[outputCount++] = MakeOutputSpec(code, quality,
             Config.custom.itemLevel, entry.quantity);
     }
     for (std::uint32_t index = 0; index < randomOutputCount; ++index) {
         const std::size_t itemIndex = ChooseCustomItemIndex();
         const CustomOutputEntry& entry = Config.custom.items[itemIndex];
-        const auto quality = ChooseCustomOutputQuality(entry);
-        outputs[outputCount++] = MakeOutputSpec(entry.code, quality,
+        const std::uint32_t code = ChooseCustomOutputCode(entry);
+        const auto quality = ChooseCustomOutputQuality(entry, code);
+        outputs[outputCount++] = MakeOutputSpec(code, quality,
             Config.custom.itemLevel, entry.quantity);
     }
     return true;
@@ -1805,6 +1833,105 @@ auto TrimInputText(std::string_view text) noexcept -> std::string_view {
     return text;
 }
 
+auto LowerAscii(std::string_view text) -> std::string {
+    std::string lowered(text);
+    for (char& character : lowered) {
+        if (character >= 'A' && character <= 'Z') {
+            character = static_cast<char>(character - 'A' + 'a');
+        }
+    }
+    return lowered;
+}
+
+auto ParseRuneNumber(std::string_view text, std::uint32_t& runeNumber) noexcept
+        -> bool {
+    if (text.size() != 3 || text[0] != 'r'
+            || text[1] < '0' || text[1] > '9'
+            || text[2] < '0' || text[2] > '9') {
+        return false;
+    }
+    runeNumber = static_cast<std::uint32_t>(text[1] - '0') * 10U
+        + static_cast<std::uint32_t>(text[2] - '0');
+    return runeNumber >= 1 && runeNumber <= RuneCount;
+}
+
+auto ParseCustomOutputCode(std::string_view text, CustomOutputEntry& entry,
+        std::string& error) -> bool {
+    const std::string lowered = LowerAscii(text);
+    const std::string_view selector(lowered);
+    if (selector == "gem" || selector.starts_with("gem:")) {
+        if (selector == "gem") {
+            for (std::size_t sizeIndex = 0;
+                    sizeIndex < GemSizeCount; ++sizeIndex) {
+                for (const std::string_view gemCode : GemCodes[sizeIndex]) {
+                    std::uint32_t parsedCode{};
+                    if (!ParseItemCode(gemCode, parsedCode)) return false;
+                    entry.selectorCodes[entry.selectorCodeCount++] = parsedCode;
+                }
+            }
+            return true;
+        }
+
+        const std::string_view sizeName = selector.substr(4);
+        for (std::size_t sizeIndex = 0;
+                sizeIndex < GemSizeCount; ++sizeIndex) {
+            if (sizeName != GemSizeNames[sizeIndex]) continue;
+            for (const std::string_view gemCode : GemCodes[sizeIndex]) {
+                std::uint32_t parsedCode{};
+                if (!ParseItemCode(gemCode, parsedCode)) return false;
+                entry.selectorCodes[entry.selectorCodeCount++] = parsedCode;
+            }
+            return true;
+        }
+        error = "custom gem selector must be 'gem' or 'gem:chipped', 'gem:flawed', 'gem:normal', 'gem:flawless', or 'gem:perfect'";
+        return false;
+    }
+
+    if (selector == "rune" || selector.starts_with("rune:")) {
+        std::uint32_t firstRune = 1;
+        std::uint32_t lastRune = RuneCount;
+        if (selector != "rune") {
+            const std::string_view range = TrimInputText(selector.substr(5));
+            const std::size_t separator = range.find('-');
+            if (separator == std::string_view::npos) {
+                if (!ParseRuneNumber(TrimInputText(range), firstRune)) {
+                    error = "custom rune selector must use rune, rune:rNN, or an inclusive range such as rune:r01-r10 (r01 through r33)";
+                    return false;
+                }
+                lastRune = firstRune;
+            } else if (range.find('-', separator + 1) != std::string_view::npos
+                    || !ParseRuneNumber(TrimInputText(range.substr(0, separator)), firstRune)
+                    || !ParseRuneNumber(TrimInputText(range.substr(separator + 1)), lastRune)
+                    || firstRune > lastRune) {
+                error = "custom rune selector must use rune, rune:rNN, or an inclusive ascending range such as rune:r01-r10 (r01 through r33)";
+                return false;
+            }
+        }
+        for (std::uint32_t runeNumber = firstRune;
+                runeNumber <= lastRune; ++runeNumber) {
+            entry.selectorCodes[entry.selectorCodeCount++] = MakeRuneCode(runeNumber);
+        }
+        return true;
+    }
+
+    if (text.empty() || text.size() > 4) {
+        error = "custom item code must be a one- to four-character D2 item code, 'gem' selector, or 'rune' selector";
+        return false;
+    }
+    std::array<char, 4> codeChars{' ', ' ', ' ', ' '};
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const unsigned char character = static_cast<unsigned char>(text[index]);
+        if (character < 0x21 || character > 0x7E) {
+            error = "custom item codes may contain only visible ASCII characters";
+            return false;
+        }
+        codeChars[index] = static_cast<char>(character);
+    }
+    entry.code = D2RL::Items::MakeItemCode(codeChars[0], codeChars[1],
+        codeChars[2], codeChars[3]);
+    return true;
+}
+
 auto ParseInputRuleList(const toml::array& inputArray,
         InputRuleList& destination) -> bool {
     if (inputArray.empty() || inputArray.size() > MaximumCubeItems) {
@@ -2542,19 +2669,14 @@ auto ParseConfig(std::string_view text, Settings& destination,
                 const auto codeText = codeNode == nullptr
                     ? std::optional<std::string>{}
                     : codeNode->value<std::string>();
-                if (!codeText || codeText->empty() || codeText->size() > 4) {
-                    error = "each custom item code must be a one- to four-character D2 item code";
+                if (!codeText || codeText->empty()
+                        || codeText->size() > MaximumCustomOutputCodeLength) {
+                    error = "each custom item code must be a one- to four-character D2 item code or a supported gem/rune selector";
                     return false;
                 }
-                std::array<char, 4> codeChars{' ', ' ', ' ', ' '};
-                for (std::size_t index = 0; index < codeText->size(); ++index) {
-                    const unsigned char character = static_cast<unsigned char>((*codeText)[index]);
-                    if (character < 0x21 || character > 0x7E) {
-                        error = "custom item codes may contain only visible ASCII characters";
-                        return false;
-                    }
-                    codeChars[index] = static_cast<char>(character);
-                }
+
+                CustomOutputEntry& entry = destination.custom.items[destination.custom.itemCount];
+                if (!ParseCustomOutputCode(*codeText, entry, error)) return false;
 
                 const auto* qualityNode = item->get("quality");
                 const auto qualityText = qualityNode == nullptr
@@ -2596,9 +2718,6 @@ auto ParseConfig(std::string_view text, Settings& destination,
                     }
                 }
 
-                CustomOutputEntry& entry = destination.custom.items[destination.custom.itemCount];
-                entry.code = D2RL::Items::MakeItemCode(codeChars[0], codeChars[1],
-                    codeChars[2], codeChars[3]);
                 entry.qualities = qualities;
                 entry.qualityCount = qualityCount;
                 entry.randomQuality = randomQuality;
@@ -3035,11 +3154,11 @@ auto Initialize(const D2RL::PluginContext* context) -> bool {
     }
     Active.store(true, std::memory_order_release);
     if (Config.activeOutputMode == OutputMode::Runes) {
-        context->LogInfo("UltimateScrapper 0.1.0 is ready in Runes mode; configured input items are accepted.");
+        context->LogInfo("UltimateScrapper 0.2.0 is ready in Runes mode; configured input items are accepted.");
     } else if (Config.activeOutputMode == OutputMode::Custom) {
-        context->LogInfo("UltimateScrapper 0.1.0 is ready in Custom mode; configured input items are accepted.");
+        context->LogInfo("UltimateScrapper 0.2.0 is ready in Custom mode; configured input items are accepted.");
     } else {
-        context->LogInfo("UltimateScrapper 0.1.0 is ready in Both mode; each transmute chooses Runes or Custom with equal probability.");
+        context->LogInfo("UltimateScrapper 0.2.0 is ready in Both mode; each transmute chooses Runes or Custom with equal probability.");
     }
     if (Config.transmuteButtonMode == TransmuteButtonMode::Native) {
         context->LogInfo("UltimateScrapper: Native button mode is active; configured plugin recipes take priority on Convert, and unmatched contents pass to D2R.");
