@@ -45,7 +45,7 @@ Entries in one recipe must match distinct cube items. Each recipe must have 1–
 - **Item type:** Use **type:** followed by a 1–4-character itemtype code. For example, **type:armo,normal** matches normal armor.
 - **Quality:** Qualities are **inferior**, **normal**, **superior**, **magic**, **set**, **rare**, **unique**, and **crafted**. If omitted, any quality matches.
 
-Itemtype rules follow the active mod's itemtype hierarchy, including **Equiv1** and **Equiv2** parent types. They read **itemtypes.txt**, **armor.txt**, **weapons.txt**, and **misc.txt** from the active mod's **data/global/excel** folder.
+Itemtype rules follow the active mod's itemtype hierarchy, including **Equiv1** and **Equiv2** parent types. They read **itemtypes.txt**, **armor.txt**, **weapons.txt**, and **misc.txt** from the active mod's **data/global/excel** folder. All plugin recipes reject items with the **ques** itemtype or a positive **quest** value in the item tables (which also covers quest items such as the Amulet of the Viper and Staff of Kings). If the plugin cannot load those tables or they do not define **ques**, it disables plugin recipe matching rather than risk consuming a quest item.
 
 Set **inputs = [""]** to use the default recipe: exactly one Unique or Set item of any code.
 
@@ -202,7 +202,7 @@ On first load, the plugin creates **ultimate-scrapper.toml** and the per-install
 
 ## Build
 
-Build requirements: Windows x64, CMake 3.29 or newer, Visual Studio 2022 or newer, and the Windows SDK. CMake fetches the pinned D2RLoader PluginSDK commit and TOML++ v3.4.0. To use a local PluginSDK checkout:
+Build requirements: Windows x64, CMake 3.29 or newer, Visual Studio 2022 or newer, and the Windows SDK. CMake fetches D2RLoader PluginSDK 0.4.0 (ABI 4, commit **03a5af9e0feb3f95f95e148e330e01f6635950df**) and TOML++ v3.4.0. To use a local PluginSDK checkout:
 
 ~~~powershell
 cmake -S . -B ..\ultimate-scrapper-build -A x64 -DULTIMATE_SCRAPPER_LOCAL_SDK_DIR="<PluginSDK checkout>"
@@ -213,7 +213,6 @@ The DLL is written to **../ultimate-scrapper-build/Release/d2rl-ultimate-scrappe
 
 ## Compatibility and license
 
-Ultimate Scrapper targets Windows x64, D2R 3.3.93847, and D2RLoader 1.3.1-beta (PluginSDK ABI 4). Version 0.2.0 adds weighted gem and rune selectors for Custom mode.
+Ultimate Scrapper targets Windows x64, D2R 3.3.93847, and D2RLoader 1.3.1-beta (PluginSDK ABI 4). Version 0.2.2 blocks items with the **ques** itemtype or a positive quest value in the active item tables from every plugin recipe and uses PluginSDK 0.4.0.
 
 The project is licensed under the MIT License. See **LICENSE** and **THIRD_PARTY_NOTICES.md** for third-party notices for TOML++ and the D2RLoader PluginSDK.
-

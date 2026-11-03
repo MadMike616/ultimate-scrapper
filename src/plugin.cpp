@@ -151,6 +151,7 @@ struct ItemTypeCatalog {
     std::unordered_map<std::uint32_t, QualityFlags> qualityFlagsByType;
     std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> directItemTypesByItemCode;
     std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> itemTypesByItemCode;
+    std::unordered_set<std::uint32_t> questItemCodes;
     std::unordered_set<std::uint32_t> equipmentItemCodes;
     std::unordered_map<std::uint32_t, std::uint32_t> itemFamilyByItemCode;
     std::unordered_set<std::uint32_t> uniqueItemCodes;
@@ -193,20 +194,20 @@ std::atomic_bool BatchModeEnabled{};
 
 constexpr D2RL::PluginInfo Info{
     .infoSize = D2RL::PluginInfoSize,
-    .apiVersion = D2RL_PLUGIN_API_VERSION,
+    .abiVersion = D2RL_PLUGIN_ABI_VERSION,
     .id = PluginId,
     .name = "Ultimate Scrapper",
-    .version = "0.2.0",
+    .version = "0.2.2",
     .author = "MadMike",
     .description = "Transmutes configured input items into runes or configurable custom items.",
     .flags = D2RL::PluginFlags::Client,
 };
 
 const D2RL::PluginContext* Context{};
-const D2RL::InventoryServiceV1* InventoryService{};
-const D2RL::ItemServiceV1* ItemService{};
-const D2RL::ThreadServiceV1* ThreadService{};
-const D2RL::SharedEventServiceV1* EventService{};
+const D2RL::InventoryService* InventoryService{};
+const D2RL::ItemService* ItemService{};
+const D2RL::ThreadService* ThreadService{};
+const D2RL::SharedEventService* EventService{};
 D2RL::SharedEvents::ListenerHandle MessageHandle{D2RL::SharedEvents::InvalidHandle};
 std::atomic<bool> Active{};
 std::atomic<bool> ExchangePending{};
@@ -244,7 +245,7 @@ auto ReadCubeItems(D2RL::PlayerHandle player, CubeCollector& cube) noexcept
         CollectCubeItem, &cube);
 }
 
-auto PackItemTypeCode(D2RL::Inventory::ItemTypeFourCC code) noexcept -> std::uint32_t {
+constexpr auto PackItemTypeCode(D2RL::Inventory::ItemTypeFourCC code) noexcept -> std::uint32_t {
     std::uint32_t packed{};
     for (std::size_t index = 0; index < 4; ++index) {
         packed |= static_cast<std::uint32_t>(
@@ -259,8 +260,19 @@ auto ItemHasType(std::uint32_t itemCode, std::uint32_t typeCode) noexcept -> boo
         && std::find(item->second.begin(), item->second.end(), typeCode) != item->second.end();
 }
 
+constexpr std::uint32_t QuestItemTypeCode = PackItemTypeCode(
+    D2RL::Inventory::MakeItemTypeFourCC("ques"));
+
+auto IsScrappableInputItem(const D2RL::Items::ItemInfo& item) noexcept -> bool {
+    return ItemTypeData.available
+        && ItemTypeData.knownTypeCodes.contains(QuestItemTypeCode)
+        && !ItemTypeData.questItemCodes.contains(item.code)
+        && !ItemHasType(item.code, QuestItemTypeCode);
+}
+
 auto InputRuleMatches(const InputRule& rule,
         const D2RL::Items::ItemInfo& item) noexcept -> bool {
+    if (!IsScrappableInputItem(item)) return false;
     const bool codeMatches = rule.anyCode
         || (rule.matchesItemType
             ? ItemHasType(item.code, rule.itemTypeCode)
@@ -310,7 +322,7 @@ auto MatchRemainingInputRules(const InputRuleList& input,
 
 auto MatchesConfiguredInputItem(const D2RL::Items::ItemInfo& item) noexcept
         -> bool {
-    if (!Config.input.valid) return false;
+    if (!Config.input.valid || !IsScrappableInputItem(item)) return false;
     if (Config.input.usingDefaultRules) {
         return item.quality == D2RL::Items::Quality::Unique
             || item.quality == D2RL::Items::Quality::Set;
@@ -2092,6 +2104,16 @@ auto IsEnabledTableFlag(std::string_view value) noexcept -> bool {
     return value == "1" || value == "true" || value == "yes";
 }
 
+auto IsQuestTableValue(std::string_view value) noexcept -> bool {
+    if (value.empty()) return false;
+    std::int32_t questId{};
+    const auto parsed = std::from_chars(value.data(),
+        value.data() + value.size(), questId);
+    return parsed.ec == std::errc{}
+        && parsed.ptr == value.data() + value.size()
+        && questId > 0;
+}
+
 auto CleanTableToken(std::string_view value) noexcept -> std::string_view {
     value = TrimTableField(value);
     if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
@@ -2155,6 +2177,7 @@ auto LoadItemTypeMemberships(const std::filesystem::path& path,
     const auto codeColumn = FindTableColumn(headers, "code");
     const auto typeColumn = FindTableColumn(headers, "type");
     const auto type2Column = FindTableColumn(headers, "type2");
+    const auto questColumn = FindTableColumn(headers, "quest");
     if (!codeColumn || !typeColumn) return false;
     const auto normCodeColumn = FindTableColumn(headers, "normcode");
     const auto uberCodeColumn = FindTableColumn(headers, "ubercode");
@@ -2168,6 +2191,11 @@ auto LoadItemTypeMemberships(const std::filesystem::path& path,
         if (!ParseItemCode(TableFieldAt(fields, *codeColumn), itemCode)) continue;
         if (++tableRows > MaximumItemRows || ++totalRows > MaximumItemRows) {
             return false;
+        }
+
+        if (questColumn
+                && IsQuestTableValue(TableFieldAt(fields, *questColumn))) {
+            catalog.questItemCodes.insert(itemCode);
         }
 
         auto& memberships = catalog.itemTypesByItemCode[itemCode];
@@ -3084,46 +3112,46 @@ auto __cdecl OnUiMessage(const D2RL::PluginContext* context,
 
 auto Initialize(const D2RL::PluginContext* context) -> bool {
     BatchModeEnabled.store(false, std::memory_order_release);
-    if (context->QueryService(D2RL::ServiceId::Inventory,
-            D2RL::InventoryServiceV1Version, &InventoryService)
+    if (context->QueryService(&InventoryService)
             != D2RL::ServiceQueryResult::Success
             || InventoryService == nullptr
-            || InventoryService->serviceSize < D2RL::InventoryServiceV1RequiredSize
+            || InventoryService->serviceSize < D2RL::InventoryServiceRequiredSize
             || InventoryService->getLocalPlayer == nullptr
             || InventoryService->forEachInventoryItem == nullptr) {
         context->LogError("UltimateScrapper: D2RLoader InventoryService v1 is required.");
         return false;
     }
-    if (context->QueryService(D2RL::ServiceId::Item,
-            D2RL::ItemServiceV1Version, &ItemService)
+    if (context->QueryService(&ItemService)
             != D2RL::ServiceQueryResult::Success
             || ItemService == nullptr
-            || ItemService->serviceSize < D2RL::ItemServiceV1RequiredSize
+            || ItemService->serviceSize < D2RL::ItemServiceRequiredSize
             || ItemService->destroyItem == nullptr
             || ItemService->executeTransaction == nullptr) {
         context->LogError("UltimateScrapper: D2RLoader ItemService v1 transaction support is required.");
         return false;
     }
-    if (context->QueryService(D2RL::ServiceId::Thread,
-            D2RL::ThreadServiceV1Version, &ThreadService)
+    if (context->QueryService(&ThreadService)
             != D2RL::ServiceQueryResult::Success
             || ThreadService == nullptr
-            || ThreadService->serviceSize < D2RL::ThreadServiceV1RequiredSize
+            || ThreadService->serviceSize < D2RL::ThreadServiceRequiredSize
             || ThreadService->runOnGameThread == nullptr) {
         context->LogError("UltimateScrapper: D2RLoader game-thread service is required.");
         return false;
     }
-    if (context->QueryService(D2RL::ServiceId::SharedEvent,
-            D2RL::SharedEventServiceV1Version, &EventService)
+    if (context->QueryService(&EventService)
             != D2RL::ServiceQueryResult::Success
             || EventService == nullptr
-            || EventService->serviceSize < D2RL::SharedEventServiceV1RequiredSize
+            || EventService->serviceSize < D2RL::SharedEventServiceRequiredSize
             || EventService->registerUiMessageListener == nullptr
             || EventService->unregisterUiMessageListener == nullptr) {
         context->LogError("UltimateScrapper: D2RLoader shared UI-message service is required.");
         return false;
     }
     (void)LoadItemTypeCatalog();
+    if (!ItemTypeData.available
+            || !ItemTypeData.knownTypeCodes.contains(QuestItemTypeCode)) {
+        context->LogWarn("UltimateScrapper: active item tables are missing or do not define 'ques'; plugin recipes are disabled to prevent quest items from being scrapped.");
+    }
     if (!LoadConfig()) return false;
     BatchModeEnabled.store(Config.batchScrapAlwaysOn,
         std::memory_order_release);
@@ -3154,11 +3182,11 @@ auto Initialize(const D2RL::PluginContext* context) -> bool {
     }
     Active.store(true, std::memory_order_release);
     if (Config.activeOutputMode == OutputMode::Runes) {
-        context->LogInfo("UltimateScrapper 0.2.0 is ready in Runes mode; configured input items are accepted.");
+        context->LogInfo("UltimateScrapper 0.2.2 is ready in Runes mode; configured input items are accepted.");
     } else if (Config.activeOutputMode == OutputMode::Custom) {
-        context->LogInfo("UltimateScrapper 0.2.0 is ready in Custom mode; configured input items are accepted.");
+        context->LogInfo("UltimateScrapper 0.2.2 is ready in Custom mode; configured input items are accepted.");
     } else {
-        context->LogInfo("UltimateScrapper 0.2.0 is ready in Both mode; each transmute chooses Runes or Custom with equal probability.");
+        context->LogInfo("UltimateScrapper 0.2.2 is ready in Both mode; each transmute chooses Runes or Custom with equal probability.");
     }
     if (Config.transmuteButtonMode == TransmuteButtonMode::Native) {
         context->LogInfo("UltimateScrapper: Native button mode is active; configured plugin recipes take priority on Convert, and unmatched contents pass to D2R.");
@@ -3201,7 +3229,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderGetPluginInfo() noexcept -> const D2RL::PluginI
 
 D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) noexcept -> bool {
     Shutdown();
-    if (!D2RL::HasContext(context) || context->apiVersion != D2RL_PLUGIN_API_VERSION) return false;
+    if (!D2RL::HasContext(context) || context->abiVersion != D2RL_PLUGIN_ABI_VERSION) return false;
     Context = context;
     bool initialized{};
     try {
@@ -3221,4 +3249,3 @@ D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
     Shutdown();
     Context = nullptr;
 }
-

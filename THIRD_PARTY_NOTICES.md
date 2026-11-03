@@ -29,8 +29,8 @@ SOFTWARE.
 
 ## D2RLoader PluginSDK
 
-The build uses the D2RLoader PluginSDK pinned to commit
-`6eb8f8b6192868214706bd6d528c5294f2f551b7`. Its headers and CMake build files
+The build uses D2RLoader PluginSDK 0.4.0 (Plugin ABI 4), pinned to commit
+`03a5af9e0feb3f95f95e148e330e01f6635950df`. Its headers and CMake build files
 are fetched during configuration and are not included in this source tree.
 
 MIT License
@@ -54,4 +54,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-

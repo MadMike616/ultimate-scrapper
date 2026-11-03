@@ -1,4 +1,7 @@
 # Input rules apply to Runes, Custom, and Both modes.
+# Items with itemtype "ques" or a positive quest value in the active item tables
+# are always rejected as plugin inputs. If the active tables cannot identify
+# "ques", plugin recipe matching fails closed.
 [ultimate-scrapper.input]
 
 # A flat inputs array is one recipe and requires every listed item. Nested
@@ -186,4 +189,3 @@ guaranteed = false
 #guaranteed =
 
 # ===== Custom mode settings: end =====
-
