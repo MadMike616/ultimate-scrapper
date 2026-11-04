@@ -197,7 +197,7 @@ constexpr D2RL::PluginInfo Info{
     .abiVersion = D2RL_PLUGIN_ABI_VERSION,
     .id = PluginId,
     .name = "Ultimate Scrapper",
-    .version = "0.2.2",
+    .version = "0.2.3",
     .author = "MadMike",
     .description = "Transmutes configured input items into runes or configurable custom items.",
     .flags = D2RL::PluginFlags::Client,
@@ -2402,7 +2402,12 @@ auto BuildOutputQualityCatalog(ItemTypeCatalog& catalog) -> void {
     }
 }
 
-auto FindItemTypeExcelDirectory() -> std::optional<std::filesystem::path> {
+struct ItemTypeExcelDirectory {
+    std::filesystem::path path;
+    bool compilerFallback{};
+};
+
+auto FindItemTypeExcelDirectory() -> std::optional<ItemTypeExcelDirectory> {
     std::vector<std::filesystem::path> roots;
     if (Context != nullptr && Context->modDirectory != nullptr
             && Context->modDirectory[0] != L'\0') {
@@ -2440,9 +2445,20 @@ auto FindItemTypeExcelDirectory() -> std::optional<std::filesystem::path> {
         candidates.push_back(root / L"data" / L"global" / L"excel");
     }
 
+    std::vector<std::filesystem::path> compilerFallbackCandidates;
+    for (const auto& root : roots) {
+        const auto fallback = root / L"data" / L"compiler" / L"3.3.0"
+            / L"data" / L"global" / L"excel";
+        if (std::find(compilerFallbackCandidates.begin(),
+                    compilerFallbackCandidates.end(), fallback)
+                == compilerFallbackCandidates.end()) {
+            compilerFallbackCandidates.push_back(fallback);
+        }
+    }
+
     constexpr std::array<const wchar_t*, 4> RequiredFiles{
         L"itemtypes.txt", L"armor.txt", L"weapons.txt", L"misc.txt"};
-    for (const auto& candidate : candidates) {
+    const auto hasRequiredFiles = [&](const std::filesystem::path& candidate) {
         bool complete = true;
         for (const wchar_t* filename : RequiredFiles) {
             std::error_code error;
@@ -2452,36 +2468,49 @@ auto FindItemTypeExcelDirectory() -> std::optional<std::filesystem::path> {
                 break;
             }
         }
-        if (complete) return candidate;
+        return complete;
+    };
+    for (const auto& candidate : candidates) {
+        if (hasRequiredFiles(candidate)) return ItemTypeExcelDirectory{
+            .path = candidate,
+            .compilerFallback = false,
+        };
+    }
+    for (const auto& candidate : compilerFallbackCandidates) {
+        if (hasRequiredFiles(candidate)) return ItemTypeExcelDirectory{
+            .path = candidate,
+            .compilerFallback = true,
+        };
     }
     return std::nullopt;
 }
 
-auto LoadItemTypeCatalog() noexcept -> bool {
+auto LoadItemTypeCatalog(bool& usedCompilerFallback) noexcept -> bool {
     ItemTypeData = {};
+    usedCompilerFallback = false;
     try {
         const auto excelDirectory = FindItemTypeExcelDirectory();
         if (!excelDirectory) return false;
 
         ItemTypeCatalog catalog;
-        if (!LoadItemTypeDefinitions(*excelDirectory / L"itemtypes.txt", catalog)) {
+        if (!LoadItemTypeDefinitions(excelDirectory->path / L"itemtypes.txt", catalog)) {
             return false;
         }
         std::size_t totalItemRows{};
-        if (!LoadItemTypeMemberships(*excelDirectory / L"armor.txt",
+        if (!LoadItemTypeMemberships(excelDirectory->path / L"armor.txt",
                     catalog, totalItemRows, true)
-                || !LoadItemTypeMemberships(*excelDirectory / L"weapons.txt",
+                || !LoadItemTypeMemberships(excelDirectory->path / L"weapons.txt",
                     catalog, totalItemRows, true)
-                || !LoadItemTypeMemberships(*excelDirectory / L"misc.txt",
+                || !LoadItemTypeMemberships(excelDirectory->path / L"misc.txt",
                     catalog, totalItemRows, false)) {
             return false;
         }
 
-        (void)LoadQualityRecordCodes(*excelDirectory / L"uniqueitems.txt",
+        (void)LoadQualityRecordCodes(excelDirectory->path / L"uniqueitems.txt",
             "code", catalog.uniqueItemCodes);
-        (void)LoadQualityRecordCodes(*excelDirectory / L"setitems.txt",
+        (void)LoadQualityRecordCodes(excelDirectory->path / L"setitems.txt",
             "item", catalog.setItemCodes);
-        (void)LoadCraftQualityRules(*excelDirectory / L"cubemain.txt", catalog);
+        (void)LoadCraftQualityRules(excelDirectory->path / L"cubemain.txt", catalog);
 
         for (auto& [itemCode, memberships] : catalog.itemTypesByItemCode) {
             (void)itemCode;
@@ -2508,6 +2537,7 @@ auto LoadItemTypeCatalog() noexcept -> bool {
         catalog.available = true;
         BuildOutputQualityCatalog(catalog);
         ItemTypeData = std::move(catalog);
+        usedCompilerFallback = excelDirectory->compilerFallback;
         return true;
     } catch (...) {
         ItemTypeData = {};
@@ -2838,7 +2868,7 @@ auto LoadConfig() noexcept -> bool {
     if (!Config.input.valid) {
         Context->LogWarn("UltimateScrapper: custom input rules are invalid; no cube inputs will be accepted. Check that every recipe contains 1 through 12 valid entries.");
         if (TypeRuleRequested && !ItemTypeData.available) {
-            Context->LogWarn("UltimateScrapper: itemtype rules require itemtypes.txt, armor.txt, weapons.txt, and misc.txt under the active mod's data/global/excel directory.");
+            Context->LogWarn("UltimateScrapper: itemtype rules require itemtypes.txt, armor.txt, weapons.txt, and misc.txt in the active mod's data/global/excel folder or its d2rloader/data/compiler/3.3.0/data/global/excel fallback.");
         }
     } else if (Config.input.usingDefaultRules) {
         Context->LogInfo("UltimateScrapper: no custom input list was found; defaulting to exactly one Unique or Set item in the cube.");
@@ -3147,10 +3177,14 @@ auto Initialize(const D2RL::PluginContext* context) -> bool {
         context->LogError("UltimateScrapper: D2RLoader shared UI-message service is required.");
         return false;
     }
-    (void)LoadItemTypeCatalog();
+    bool usedCompilerFallback{};
+    (void)LoadItemTypeCatalog(usedCompilerFallback);
+    if (usedCompilerFallback) {
+        context->LogInfo("UltimateScrapper: active item tables are incomplete; using the base tables from d2rloader/data/compiler/3.3.0/data/global/excel.");
+    }
     if (!ItemTypeData.available
             || !ItemTypeData.knownTypeCodes.contains(QuestItemTypeCode)) {
-        context->LogWarn("UltimateScrapper: active item tables are missing or do not define 'ques'; plugin recipes are disabled to prevent quest items from being scrapped.");
+        context->LogWarn("UltimateScrapper: item tables are missing or do not define 'ques'; plugin recipes are disabled to prevent quest items from being scrapped.");
     }
     if (!LoadConfig()) return false;
     BatchModeEnabled.store(Config.batchScrapAlwaysOn,
@@ -3182,11 +3216,11 @@ auto Initialize(const D2RL::PluginContext* context) -> bool {
     }
     Active.store(true, std::memory_order_release);
     if (Config.activeOutputMode == OutputMode::Runes) {
-        context->LogInfo("UltimateScrapper 0.2.2 is ready in Runes mode; configured input items are accepted.");
+        context->LogInfo("UltimateScrapper 0.2.3 is ready in Runes mode; configured input items are accepted.");
     } else if (Config.activeOutputMode == OutputMode::Custom) {
-        context->LogInfo("UltimateScrapper 0.2.2 is ready in Custom mode; configured input items are accepted.");
+        context->LogInfo("UltimateScrapper 0.2.3 is ready in Custom mode; configured input items are accepted.");
     } else {
-        context->LogInfo("UltimateScrapper 0.2.2 is ready in Both mode; each transmute chooses Runes or Custom with equal probability.");
+        context->LogInfo("UltimateScrapper 0.2.3 is ready in Both mode; each transmute chooses Runes or Custom with equal probability.");
     }
     if (Config.transmuteButtonMode == TransmuteButtonMode::Native) {
         context->LogInfo("UltimateScrapper: Native button mode is active; configured plugin recipes take priority on Convert, and unmatched contents pass to D2R.");
