@@ -209,10 +209,10 @@ cmake -S . -B ..\ultimate-scrapper-build -A x64 -DULTIMATE_SCRAPPER_LOCAL_SDK_DI
 cmake --build ..\ultimate-scrapper-build --config Release --target ultimate_scrapper
 ~~~
 
-The DLL is written to **../ultimate-scrapper-build/Release/d2rl-ultimate-scrapper.dll**. Manual builds also need the generated **default_config.hpp** and TOML++ include directory.
+The `--config Release` option is required for distributed DLLs; do not release a Debug build. The DLL is written to **../ultimate-scrapper-build/Release/d2rl-ultimate-scrapper.dll**. Manual builds also need the generated **default_config.hpp** and TOML++ include directory.
 
 ## Compatibility and license
 
-Ultimate Scrapper targets Windows x64, D2R 3.3.93847, and D2RLoader 1.3.1-beta (PluginSDK ABI 4). Version 0.2.3 adds base item table fallback from **d2rloader/data/compiler/3.3.0/data/global/excel** when the active mod lacks the complete required table set. It continues to block items with the **ques** itemtype or a positive quest value in the selected tables from every plugin recipe and uses PluginSDK 0.4.0.
+Ultimate Scrapper targets Windows x64, D2R 3.3.93847, and D2RLoader 1.3.1-beta (PluginSDK ABI 4). Version 0.2.3 adds base item table fallback from **d2rloader/data/compiler/3.3.0/data/global/excel** when the active mod lacks the complete required table set. Version 0.2.4 is a fresh CMake Release build of that behavior; it does not change recipe behavior or TOML settings. The plugin continues to block items with the **ques** itemtype or a positive quest value in the selected tables from every plugin recipe and uses PluginSDK 0.4.0.
 
 The project is licensed under the MIT License. See **LICENSE** and **THIRD_PARTY_NOTICES.md** for third-party notices for TOML++ and the D2RLoader PluginSDK.

@@ -1,3285 +1,783 @@
-#include <D2RLPlugin/api.h>
-
-#include "default_config.hpp"
-
-#include <windows.h>
-
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <charconv>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <filesystem>
-#include <fstream>
-#include <iterator>
-#include <limits>
-#include <mutex>
-#include <optional>
-#include <random>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
-
-#include <toml++/toml.hpp>
-
-namespace {
-
-constexpr char PluginId[] = "ultimate-scrapper";
-constexpr char ConvertTarget[] = "HoradricCubePanelMessage";
-constexpr char StashConvertTarget[] = "BankPanelMessage";
-constexpr char ConvertCommand[] = "Convert";
-constexpr char ScrapperButtonMarker[] = "UltimateScrapper";
-constexpr char BatchToggleMarker[] = "UltimateScrapperBatch";
-constexpr std::size_t MaximumCubeItems = 12;
-constexpr std::size_t MaximumInputLists = 64;
-constexpr std::size_t MaximumItemTypeRows = 2048;
-constexpr std::size_t MaximumItemRows = 16384;
-constexpr std::size_t MaximumCustomPoolEntries = 64;
-constexpr std::size_t MaximumItemQualities = 8;
-constexpr std::uint32_t RuneCount = 33;
-constexpr std::size_t GemSizeCount = 5;
-constexpr std::size_t GemsPerSize = 7;
-constexpr std::size_t MaximumSelectorCodes = GemSizeCount * GemsPerSize;
-constexpr std::size_t MaximumCustomOutputCodeLength = 32;
-constexpr std::uint32_t MaximumRuneOutputs = 3;
-constexpr std::uint32_t MaximumCustomRandomOutputs = 12;
-constexpr std::size_t MaximumCustomOutputs = D2RL::Items::MaxTransactionOutputs;
-constexpr std::uint32_t RuneRarityStepPercent = 80;
-constexpr wchar_t ConfigFileName[] = L"ultimate-scrapper.toml";
-constexpr std::array<std::string_view, RuneCount> RuneNames{
-    "el", "eld", "tir", "nef", "eth", "ith", "tal", "ral", "ort",
-    "thul", "amn", "sol", "shael", "dol", "hel", "io", "lum", "ko",
-    "fal", "lem", "pul", "um", "mal", "ist", "gul", "vex", "ohm",
-    "lo", "sur", "ber", "jah", "cham", "zod",
-};
-constexpr std::array<std::string_view, GemSizeCount> GemSizeNames{
-    "chipped", "flawed", "normal", "flawless", "perfect",
-};
-constexpr std::array<std::array<std::string_view, GemsPerSize>, GemSizeCount>
-    GemCodes{{
-        {"gcv", "gcy", "gcb", "gcg", "gcr", "gcw", "skc"},
-        {"gfv", "gfy", "gfb", "gfg", "gfr", "gfw", "skf"},
-        {"gsv", "gsy", "gsb", "gsg", "gsr", "gsw", "sku"},
-        {"gzv", "gly", "glb", "glg", "glr", "glw", "skl"},
-        {"gpv", "gpy", "gpb", "gpg", "gpr", "gpw", "skz"},
-    }};
-
-auto MakeDefaultRuneWeights() -> std::array<double, RuneCount> {
-    std::array<double, RuneCount> weights{};
-    double weight = 100.0;
-    for (double& runeWeight : weights) {
-        runeWeight = weight;
-        weight *= static_cast<double>(RuneRarityStepPercent) / 100.0;
-    }
-    return weights;
-}
-
-struct RuneSettings {
-    std::uint32_t failureChancePercent{30};
-    std::array<std::uint32_t, MaximumRuneOutputs> outputCountWeights{70, 25, 5};
-    std::array<double, RuneCount> runeWeights = MakeDefaultRuneWeights();
-    double totalRuneWeight{};
-};
-
-enum class OutputMode {
-    Runes,
-    Custom,
-    Both,
-};
-
-enum class TransmuteButtonMode {
-    Native,
-    Separate,
-};
-
-struct CustomOutputEntry {
-    std::uint32_t code{};
-    std::array<std::uint32_t, MaximumSelectorCodes> selectorCodes{};
-    std::size_t selectorCodeCount{};
-    std::array<D2RL::Items::Quality, MaximumItemQualities> qualities{};
-    std::size_t qualityCount{};
-    std::uint32_t quantity{D2RL::Items::DefaultValue};
-    double weight{1.0};
-    bool guaranteed{};
-    bool randomQuality{};
-};
-
-struct CustomSettings {
-    std::uint32_t failureChancePercent{30};
-    std::array<std::uint32_t, MaximumCustomRandomOutputs> outputCountWeights{100};
-    std::uint32_t itemLevel{1};
-    std::array<CustomOutputEntry, MaximumCustomPoolEntries> items{};
-    std::size_t itemCount{};
-    std::size_t guaranteedCount{};
-    double totalWeight{};
-};
-
-struct InputRule {
-    std::uint32_t code{};
-    std::uint32_t itemTypeCode{};
-    D2RL::Items::Quality quality{D2RL::Items::Quality::Unknown};
-    bool anyCode{};
-    bool matchesItemType{};
-    bool hasQuality{};
-};
-
-struct InputRuleList {
-    std::array<InputRule, MaximumCubeItems> items{};
-    std::size_t itemCount{};
-};
-
-struct InputSettings {
-    std::array<InputRuleList, MaximumInputLists> lists{};
-    std::size_t listCount{};
-    bool usingDefaultRules{true};
-    bool valid{true};
-};
-
-struct ItemTypeCatalog {
-    std::unordered_set<std::uint32_t> knownTypeCodes;
-    std::unordered_map<std::uint32_t, std::array<std::uint32_t, 2>> parentTypes;
-    struct QualityFlags {
-        bool magic{};
-        bool rare{};
-        bool normal{};
-    };
-    std::unordered_map<std::uint32_t, QualityFlags> qualityFlagsByType;
-    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> directItemTypesByItemCode;
-    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> itemTypesByItemCode;
-    std::unordered_set<std::uint32_t> questItemCodes;
-    std::unordered_set<std::uint32_t> equipmentItemCodes;
-    std::unordered_map<std::uint32_t, std::uint32_t> itemFamilyByItemCode;
-    std::unordered_set<std::uint32_t> uniqueItemCodes;
-    std::unordered_set<std::uint32_t> setItemCodes;
-    std::unordered_set<std::uint32_t> craftedItemCodes;
-    std::unordered_set<std::uint32_t> craftedItemTypeCodes;
-    std::unordered_set<std::uint32_t> craftedItemFamilies;
-    std::unordered_map<std::uint32_t, std::vector<D2RL::Items::Quality>> validQualitiesByItemCode;
-    bool available{};
-};
-
-struct Settings {
-    OutputMode activeOutputMode{OutputMode::Runes};
-    TransmuteButtonMode transmuteButtonMode{TransmuteButtonMode::Separate};
-    bool showBatchCheckboxes{true};
-    bool batchScrapAlwaysOn{};
-    InputSettings input;
-    RuneSettings runes;
-    CustomSettings custom;
-};
-
-struct PendingExchange {
-    D2RL::PlayerHandle player{D2RL::InvalidPlayerHandle};
-    std::array<D2RL::Items::ItemInfo, MaximumCubeItems> items{};
-    std::size_t itemCount{};
-    bool batchModeRequested{};
-    bool processIndividually{};
-};
-
-struct CubeCollector {
-    std::array<D2RL::Items::ItemInfo, MaximumCubeItems> items{};
-    std::size_t count{};
-    bool overflow{};
-};
-
-Settings Config;
-ItemTypeCatalog ItemTypeData;
-bool TypeRuleRequested{};
-std::atomic_bool BatchModeEnabled{};
-
-constexpr D2RL::PluginInfo Info{
-    .infoSize = D2RL::PluginInfoSize,
-    .abiVersion = D2RL_PLUGIN_ABI_VERSION,
-    .id = PluginId,
-    .name = "Ultimate Scrapper",
-    .version = "0.2.3",
-    .author = "MadMike",
-    .description = "Transmutes configured input items into runes or configurable custom items.",
-    .flags = D2RL::PluginFlags::Client,
-};
-
-const D2RL::PluginContext* Context{};
-const D2RL::InventoryService* InventoryService{};
-const D2RL::ItemService* ItemService{};
-const D2RL::ThreadService* ThreadService{};
-const D2RL::SharedEventService* EventService{};
-D2RL::SharedEvents::ListenerHandle MessageHandle{D2RL::SharedEvents::InvalidHandle};
-std::atomic<bool> Active{};
-std::atomic<bool> ExchangePending{};
-std::atomic<bool> ConvertMessageLogged{};
-std::atomic<bool> ScrapperButtonMessageLogged{};
-std::atomic<bool> MismatchMessageLogged{};
-std::mutex PendingMutex;
-PendingExchange Pending;
-std::mt19937 RandomEngine;
-
-auto __cdecl CollectCubeItem(const D2RL::PluginContext*, const D2RL::Items::ItemInfo* item,
-        void* userData) noexcept -> D2RL::Inventory::IterationAction {
-    auto* collector = static_cast<CubeCollector*>(userData);
-    if (collector == nullptr || item == nullptr
-            || item->structSize < D2RL::Items::ItemInfoRequiredSize) {
-        return D2RL::Inventory::IterationAction::Continue;
-    }
-    if (collector->count >= collector->items.size()) {
-        collector->overflow = true;
-        return D2RL::Inventory::IterationAction::Stop;
-    }
-    collector->items[collector->count++] = *item;
-    return D2RL::Inventory::IterationAction::Continue;
-}
-
-auto ReadCubeItems(D2RL::PlayerHandle player, CubeCollector& cube) noexcept
-        -> D2RL::Inventory::Result {
-    const D2RL::Inventory::ItemFilter filter{
-        .structSize = D2RL::Inventory::ItemFilterSize,
-        .flags = 0,
-        .containerMask = D2RL::Items::ContainerBit(D2RL::Items::ItemContainer::Cube),
-        .reserved = 0,
-    };
-    return InventoryService->forEachInventoryItem(Context, player, &filter,
-        CollectCubeItem, &cube);
-}
-
-constexpr auto PackItemTypeCode(D2RL::Inventory::ItemTypeFourCC code) noexcept -> std::uint32_t {
-    std::uint32_t packed{};
-    for (std::size_t index = 0; index < 4; ++index) {
-        packed |= static_cast<std::uint32_t>(
-            static_cast<unsigned char>(code.value[index])) << (index * 8U);
-    }
-    return packed;
-}
-
-auto ItemHasType(std::uint32_t itemCode, std::uint32_t typeCode) noexcept -> bool {
-    const auto item = ItemTypeData.itemTypesByItemCode.find(itemCode);
-    return item != ItemTypeData.itemTypesByItemCode.end()
-        && std::find(item->second.begin(), item->second.end(), typeCode) != item->second.end();
-}
-
-constexpr std::uint32_t QuestItemTypeCode = PackItemTypeCode(
-    D2RL::Inventory::MakeItemTypeFourCC("ques"));
-
-auto IsScrappableInputItem(const D2RL::Items::ItemInfo& item) noexcept -> bool {
-    return ItemTypeData.available
-        && ItemTypeData.knownTypeCodes.contains(QuestItemTypeCode)
-        && !ItemTypeData.questItemCodes.contains(item.code)
-        && !ItemHasType(item.code, QuestItemTypeCode);
-}
-
-auto InputRuleMatches(const InputRule& rule,
-        const D2RL::Items::ItemInfo& item) noexcept -> bool {
-    if (!IsScrappableInputItem(item)) return false;
-    const bool codeMatches = rule.anyCode
-        || (rule.matchesItemType
-            ? ItemHasType(item.code, rule.itemTypeCode)
-            : item.code == rule.code);
-    return codeMatches
-        && (!rule.hasQuality || item.quality == rule.quality);
-}
-
-auto MatchRemainingInputRules(const InputRuleList& input,
-        const CubeCollector& cube, std::uint16_t assignedRules,
-        std::uint16_t usedItems) noexcept -> bool {
-    const std::uint16_t allRules = static_cast<std::uint16_t>(
-        (1U << input.itemCount) - 1U);
-    if (assignedRules == allRules) return true;
-
-    std::size_t selectedRule = input.itemCount;
-    std::size_t selectedCandidateCount = MaximumCubeItems + 1;
-    for (std::size_t ruleIndex = 0; ruleIndex < input.itemCount; ++ruleIndex) {
-        if ((assignedRules & (1U << ruleIndex)) != 0) continue;
-        std::size_t candidates{};
-        for (std::size_t itemIndex = 0; itemIndex < cube.count; ++itemIndex) {
-            if ((usedItems & (1U << itemIndex)) == 0
-                    && InputRuleMatches(input.items[ruleIndex], cube.items[itemIndex])) {
-                ++candidates;
-            }
-        }
-        if (candidates < selectedCandidateCount) {
-            selectedRule = ruleIndex;
-            selectedCandidateCount = candidates;
-        }
-    }
-    if (selectedRule == input.itemCount || selectedCandidateCount == 0) return false;
-
-    for (std::size_t itemIndex = 0; itemIndex < cube.count; ++itemIndex) {
-        if ((usedItems & (1U << itemIndex)) != 0
-                || !InputRuleMatches(input.items[selectedRule], cube.items[itemIndex])) {
-            continue;
-        }
-        if (MatchRemainingInputRules(input, cube,
-                static_cast<std::uint16_t>(assignedRules | (1U << selectedRule)),
-                static_cast<std::uint16_t>(usedItems | (1U << itemIndex)))) {
-            return true;
-        }
-    }
-    return false;
-}
-
-auto MatchesConfiguredInputItem(const D2RL::Items::ItemInfo& item) noexcept
-        -> bool {
-    if (!Config.input.valid || !IsScrappableInputItem(item)) return false;
-    if (Config.input.usingDefaultRules) {
-        return item.quality == D2RL::Items::Quality::Unique
-            || item.quality == D2RL::Items::Quality::Set;
-    }
-
-    CubeCollector singleItemCube;
-    singleItemCube.items[0] = item;
-    singleItemCube.count = 1;
-    for (std::size_t listIndex = 0; listIndex < Config.input.listCount;
-            ++listIndex) {
-        const InputRuleList& input = Config.input.lists[listIndex];
-        if (input.itemCount == 1
-                && MatchRemainingInputRules(input, singleItemCube, 0, 0)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-auto MatchesBatchInputs(const CubeCollector& cube) noexcept -> bool {
-    if (cube.count == 0 || cube.count > MaximumCubeItems || cube.overflow) {
-        return false;
-    }
-    for (std::size_t index = 0; index < cube.count; ++index) {
-        if (!MatchesConfiguredInputItem(cube.items[index])) return false;
-    }
-    return true;
-}
-
-auto MatchesConfiguredInputs(const CubeCollector& cube,
-        bool batchModeRequested, bool& processIndividually) noexcept -> bool {
-    processIndividually = false;
-    if (!Config.input.valid || cube.overflow) return false;
-    if (batchModeRequested && MatchesBatchInputs(cube)) {
-        processIndividually = true;
-        return true;
-    }
-    if (Config.input.usingDefaultRules) {
-        return cube.count == 1 && MatchesConfiguredInputItem(cube.items[0]);
-    }
-    if (cube.count > MaximumCubeItems) {
-        return false;
-    }
-    for (std::size_t listIndex = 0; listIndex < Config.input.listCount; ++listIndex) {
-        const InputRuleList& input = Config.input.lists[listIndex];
-        if (cube.count == input.itemCount
-                && MatchRemainingInputRules(input, cube, 0, 0)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-auto MatchesPending(const CubeCollector& cube,
-        const PendingExchange& pending) noexcept -> bool {
-    bool processIndividually{};
-    if (!MatchesConfiguredInputs(cube, pending.batchModeRequested,
-                processIndividually)
-            || processIndividually != pending.processIndividually
-            || cube.count != pending.itemCount) return false;
-    std::uint16_t matchedItems{};
-    for (std::size_t pendingIndex = 0; pendingIndex < pending.itemCount; ++pendingIndex) {
-        const auto& expected = pending.items[pendingIndex];
-        bool found{};
-        for (std::size_t itemIndex = 0; itemIndex < cube.count; ++itemIndex) {
-            const auto& actual = cube.items[itemIndex];
-            if ((matchedItems & (1U << itemIndex)) == 0
-                    && actual.code == expected.code
-                    && actual.quality == expected.quality
-                    && actual.qualityRecordId == expected.qualityRecordId) {
-                found = true;
-                matchedItems = static_cast<std::uint16_t>(matchedItems | (1U << itemIndex));
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-    return true;
-}
-
-constexpr auto MakeRuneCode(std::uint32_t runeNumber) noexcept -> std::uint32_t {
-    return D2RL::Items::MakeItemCode('r',
-        static_cast<char>('0' + runeNumber / 10U),
-        static_cast<char>('0' + runeNumber % 10U));
-}
-
-auto OutputIdentifiedStateFlags(std::uint32_t itemCode) noexcept
-        -> std::uint32_t {
-    bool isNativeRune{};
-    for (std::uint32_t runeNumber = 1; runeNumber <= RuneCount; ++runeNumber) {
-        if (itemCode == MakeRuneCode(runeNumber)) {
-            isNativeRune = true;
-            break;
-        }
-    }
-    if (isNativeRune
-            || ItemHasType(itemCode, D2RL::Items::MakeItemCode("rune"))
-            || ItemHasType(itemCode, D2RL::Items::MakeItemCode("gem"))) {
-        return D2RL::Items::ItemStateIdentified;
-    }
-    if (!ItemHasType(itemCode, D2RL::Items::MakeItemCode("misc"))) {
-        return 0;
-    }
-
-    constexpr std::array<std::uint32_t, 6> excludedMiscTypes{
-        D2RL::Items::MakeItemCode("amul"),
-        D2RL::Items::MakeItemCode("ring"),
-        D2RL::Items::MakeItemCode("bowq"),
-        D2RL::Items::MakeItemCode("xboq"),
-        D2RL::Items::MakeItemCode("char"),
-        D2RL::Items::MakeItemCode("torc"),
-    };
-    const bool excluded = std::any_of(excludedMiscTypes.begin(),
-        excludedMiscTypes.end(), [itemCode](std::uint32_t typeCode) noexcept {
-            return ItemHasType(itemCode, typeCode);
-        });
-    return excluded ? 0 : D2RL::Items::ItemStateIdentified;
-}
-
-template <typename WeightAt>
-auto ChooseWeightedIndex(std::size_t count, double totalWeight,
-        WeightAt weightAt) noexcept -> std::size_t {
-    const double roll = std::uniform_real_distribution<double>(0.0, totalWeight)(RandomEngine);
-    double cumulative{};
-    std::size_t lastPositive{};
-    for (std::size_t index = 0; index < count; ++index) {
-        const double weight = weightAt(index);
-        if (weight <= 0.0) continue;
-        lastPositive = index;
-        cumulative += weight;
-        if (roll < cumulative) return index;
-    }
-    return lastPositive;
-}
-
-auto ChooseRuneIndex() noexcept -> std::size_t {
-    return ChooseWeightedIndex(Config.runes.runeWeights.size(),
-        Config.runes.totalRuneWeight, [](std::size_t index) noexcept {
-            return Config.runes.runeWeights[index];
-        });
-}
-
-auto ChooseCustomItemIndex() noexcept -> std::size_t {
-    return ChooseWeightedIndex(Config.custom.itemCount,
-        Config.custom.totalWeight, [](std::size_t index) noexcept {
-            const CustomOutputEntry& entry = Config.custom.items[index];
-            return entry.guaranteed ? 0.0 : entry.weight;
-    });
-}
-
-auto ChooseCustomOutputCode(const CustomOutputEntry& entry) noexcept
-        -> std::uint32_t {
-    if (entry.selectorCodeCount == 0) return entry.code;
-    const std::size_t index = std::uniform_int_distribution<std::size_t>(
-        0, entry.selectorCodeCount - 1)(RandomEngine);
-    return entry.selectorCodes[index];
-}
-
-auto ChooseRandomQuality(std::uint32_t itemCode) noexcept
-        -> D2RL::Items::Quality {
-    const auto found = ItemTypeData.validQualitiesByItemCode.find(itemCode);
-    if (found == ItemTypeData.validQualitiesByItemCode.end()
-            || found->second.empty()) {
-        return D2RL::Items::Quality::Normal;
-    }
-    const std::size_t index = std::uniform_int_distribution<std::size_t>(
-        0, found->second.size() - 1)(RandomEngine);
-    return found->second[index];
-}
-
-auto ChooseCustomOutputQuality(const CustomOutputEntry& entry,
-        std::uint32_t itemCode) noexcept
-        -> D2RL::Items::Quality {
-    if (entry.randomQuality) return ChooseRandomQuality(itemCode);
-    if (entry.qualityCount == 0) return D2RL::Items::Quality::Normal;
-    const std::size_t index = std::uniform_int_distribution<std::size_t>(
-        0, entry.qualityCount - 1)(RandomEngine);
-    return entry.qualities[index];
-}
-
-auto ChooseOutputMode() noexcept -> OutputMode {
-    if (Config.activeOutputMode != OutputMode::Both) {
-        return Config.activeOutputMode;
-    }
-    return std::uniform_int_distribution<std::uint32_t>(0, 1)(RandomEngine) == 0
-        ? OutputMode::Runes : OutputMode::Custom;
-}
-
-auto MakeOutputSpec(std::uint32_t code, D2RL::Items::Quality quality,
-        std::uint32_t itemLevel, std::uint32_t quantity) noexcept
-        -> D2RL::Items::ItemCreateSpec {
-    D2RL::Items::ItemCreateSpec output{};
-    output.structSize = D2RL::Items::ItemCreateSpecSize;
-    output.code = code;
-    output.quality = quality;
-    output.qualityRecordId = D2RL::Items::RandomQualityRecord;
-    output.itemLevel = itemLevel;
-    output.seedMode = D2RL::Items::SeedMode::Random;
-    output.quantity = quantity;
-    output.durability = D2RL::Items::DefaultValue;
-    output.socketCount = 0;
-    output.stateFlags = OutputIdentifiedStateFlags(code);
-    output.destination = {
-        .structSize = D2RL::Items::ItemDestinationSize,
-        .flags = 0,
-        .container = D2RL::Items::ItemContainer::Cube,
-        .placement = D2RL::Items::Placement::Automatic,
-        .customPageHandle = 0,
-        .x = 0,
-        .y = 0,
-    };
-    return output;
-}
-
-auto AppendRuneOutputs(
-        std::array<D2RL::Items::ItemCreateSpec, MaximumCustomOutputs>& outputs,
-        std::size_t& outputCount) noexcept -> bool {
-    const std::uint32_t countRoll =
-        std::uniform_int_distribution<std::uint32_t>(1, 100)(RandomEngine);
-    std::uint32_t cumulative{};
-    std::uint32_t count{};
-    for (std::size_t index = 0;
-            index < Config.runes.outputCountWeights.size(); ++index) {
-        cumulative += Config.runes.outputCountWeights[index];
-        if (countRoll <= cumulative) {
-            count = static_cast<std::uint32_t>(index + 1);
-            break;
-        }
-    }
-    if (count == 0 || outputCount > MaximumCustomOutputs
-            || count > MaximumCustomOutputs - outputCount) {
-        return false;
-    }
-    for (std::uint32_t index = 0; index < count; ++index) {
-        const std::size_t runeIndex = ChooseRuneIndex();
-        outputs[outputCount++] = MakeOutputSpec(MakeRuneCode(
-            static_cast<std::uint32_t>(runeIndex + 1)),
-            D2RL::Items::Quality::Normal, 1, D2RL::Items::DefaultValue);
-    }
-    return true;
-}
-
-auto AppendCustomOutputs(
-        std::array<D2RL::Items::ItemCreateSpec, MaximumCustomOutputs>& outputs,
-        std::size_t& outputCount) noexcept -> bool {
-    const std::uint32_t countRoll =
-        std::uniform_int_distribution<std::uint32_t>(1, 100)(RandomEngine);
-    std::uint32_t cumulative{};
-    std::uint32_t randomOutputCount{};
-    for (std::size_t index = 0;
-            index < Config.custom.outputCountWeights.size(); ++index) {
-        cumulative += Config.custom.outputCountWeights[index];
-        if (countRoll <= cumulative) {
-            randomOutputCount = static_cast<std::uint32_t>(index + 1);
-            break;
-        }
-    }
-    const std::size_t additionalCount = Config.custom.guaranteedCount
-        + randomOutputCount;
-    if (randomOutputCount == 0 || outputCount > MaximumCustomOutputs
-            || additionalCount > MaximumCustomOutputs - outputCount) {
-        return false;
-    }
-
-    for (std::size_t index = 0; index < Config.custom.itemCount; ++index) {
-        const CustomOutputEntry& entry = Config.custom.items[index];
-        if (!entry.guaranteed) continue;
-        const std::uint32_t code = ChooseCustomOutputCode(entry);
-        const auto quality = ChooseCustomOutputQuality(entry, code);
-        outputs[outputCount++] = MakeOutputSpec(code, quality,
-            Config.custom.itemLevel, entry.quantity);
-    }
-    for (std::uint32_t index = 0; index < randomOutputCount; ++index) {
-        const std::size_t itemIndex = ChooseCustomItemIndex();
-        const CustomOutputEntry& entry = Config.custom.items[itemIndex];
-        const std::uint32_t code = ChooseCustomOutputCode(entry);
-        const auto quality = ChooseCustomOutputQuality(entry, code);
-        outputs[outputCount++] = MakeOutputSpec(code, quality,
-            Config.custom.itemLevel, entry.quantity);
-    }
-    return true;
-}
-
-auto AppendOutputsForMode(OutputMode mode,
-        std::array<D2RL::Items::ItemCreateSpec, MaximumCustomOutputs>& outputs,
-        std::size_t& outputCount) noexcept -> bool {
-    return mode == OutputMode::Runes
-        ? AppendRuneOutputs(outputs, outputCount)
-        : AppendCustomOutputs(outputs, outputCount);
-}
-
-auto ConfigPath() -> std::filesystem::path {
-    if (Context != nullptr && Context->pluginConfigPath != nullptr
-            && Context->pluginConfigPath[0] != L'\0') {
-        return std::filesystem::path(Context->pluginConfigPath);
-    }
-    std::error_code error;
-    const auto current = std::filesystem::current_path(error);
-    if (error) return {};
-    return current / L"d2rloader" / L"config" / ConfigFileName;
-}
-
-struct JsonObjectRange {
-    std::size_t begin{};
-    std::size_t end{};
-};
-
-struct JsonArrayRange {
-    std::size_t begin{};
-    std::size_t end{};
-};
-
-struct JsonMemberLocation {
-    std::size_t key{};
-    std::size_t value{};
-};
-
-void SkipJsonWhitespace(std::string_view json, std::size_t& position,
-        std::size_t limit) noexcept {
-    while (position < limit && (json[position] == ' ' || json[position] == '\t'
-            || json[position] == '\r' || json[position] == '\n')) {
-        ++position;
-    }
-}
-
-auto ReadJsonString(std::string_view json, std::size_t quotePosition,
-        std::size_t limit, std::size_t& after) noexcept
-        -> std::optional<std::string_view> {
-    if (quotePosition >= limit || json[quotePosition] != '"') return std::nullopt;
-    for (std::size_t position = quotePosition + 1; position < limit; ++position) {
-        if (json[position] == '\\') {
-            ++position;
-        } else if (json[position] == '"') {
-            after = position + 1;
-            return json.substr(quotePosition + 1,
-                position - quotePosition - 1);
-        }
-    }
-    return std::nullopt;
-}
-
-auto FindMatchingJsonBrace(std::string_view json, std::size_t opening,
-        std::size_t limit) noexcept -> std::optional<std::size_t> {
-    if (opening >= limit || json[opening] != '{') return std::nullopt;
-    std::size_t depth{};
-    bool inString{};
-    bool escaped{};
-    for (std::size_t position = opening; position < limit; ++position) {
-        const char current = json[position];
-        if (inString) {
-            if (escaped) {
-                escaped = false;
-            } else if (current == '\\') {
-                escaped = true;
-            } else if (current == '"') {
-                inString = false;
-            }
-            continue;
-        }
-        if (current == '"') {
-            inString = true;
-        } else if (current == '{') {
-            ++depth;
-        } else if (current == '}' && --depth == 0) {
-            return position;
-        }
-    }
-    return std::nullopt;
-}
-
-auto FindNamedJsonObject(std::string_view json, std::string_view name)
-        -> std::optional<JsonObjectRange> {
-    std::vector<std::size_t> objectStack;
-    for (std::size_t position = 0; position < json.size();) {
-        if (json[position] == '"') {
-            std::size_t afterKey{};
-            const auto stringValue = ReadJsonString(json, position,
-                json.size(), afterKey);
-            if (!stringValue) return std::nullopt;
-            if (*stringValue == "name" && !objectStack.empty()) {
-                std::size_t valuePosition = afterKey;
-                SkipJsonWhitespace(json, valuePosition, json.size());
-                if (valuePosition < json.size()
-                        && json[valuePosition] == ':') {
-                    ++valuePosition;
-                    SkipJsonWhitespace(json, valuePosition, json.size());
-                    std::size_t afterValue{};
-                    const auto value = ReadJsonString(json, valuePosition,
-                        json.size(), afterValue);
-                    if (value && *value == name) {
-                        const std::size_t objectStart = objectStack.back();
-                        const auto objectEnd = FindMatchingJsonBrace(json,
-                            objectStart, json.size());
-                        if (!objectEnd) return std::nullopt;
-                        return JsonObjectRange{objectStart, *objectEnd};
-                    }
-                }
-            }
-            position = afterKey;
-            continue;
-        }
-        if (json[position] == '{') {
-            objectStack.push_back(position);
-        } else if (json[position] == '}' && !objectStack.empty()) {
-            objectStack.pop_back();
-        }
-        ++position;
-    }
-    return std::nullopt;
-}
-
-auto FindDirectJsonMember(std::string_view json, JsonObjectRange object,
-        std::string_view key) noexcept -> std::optional<JsonMemberLocation> {
-    std::size_t nestedDepth{};
-    for (std::size_t position = object.begin + 1; position < object.end;) {
-        if (json[position] == '"') {
-            std::size_t afterKey{};
-            const auto stringValue = ReadJsonString(json, position,
-                object.end, afterKey);
-            if (!stringValue) return std::nullopt;
-            if (nestedDepth == 0 && *stringValue == key) {
-                std::size_t valuePosition = afterKey;
-                SkipJsonWhitespace(json, valuePosition, object.end);
-                if (valuePosition >= object.end || json[valuePosition] != ':') {
-                    return std::nullopt;
-                }
-                ++valuePosition;
-                SkipJsonWhitespace(json, valuePosition, object.end);
-                return JsonMemberLocation{position, valuePosition};
-            }
-            position = afterKey;
-            continue;
-        }
-        if (json[position] == '{' || json[position] == '[') {
-            ++nestedDepth;
-        } else if ((json[position] == '}' || json[position] == ']')
-                && nestedDepth > 0) {
-            --nestedDepth;
-        }
-        ++position;
-    }
-    return std::nullopt;
-}
-
-auto FindJsonObjectMember(std::string_view json, JsonObjectRange object,
-        std::string_view key) noexcept -> std::optional<JsonObjectRange> {
-    const auto member = FindDirectJsonMember(json, object, key);
-    if (!member || member->value >= object.end || json[member->value] != '{') {
-        return std::nullopt;
-    }
-    const auto end = FindMatchingJsonBrace(json, member->value, object.end + 1);
-    if (!end) return std::nullopt;
-    return JsonObjectRange{member->value, *end};
-}
-
-auto ReadDirectJsonString(std::string_view json, JsonObjectRange object,
-        std::string_view key) -> std::optional<std::string> {
-    const auto member = FindDirectJsonMember(json, object, key);
-    if (!member) return std::nullopt;
-    std::size_t afterValue{};
-    const auto value = ReadJsonString(json, member->value, object.end,
-        afterValue);
-    return value ? std::optional<std::string>(std::string(*value))
-        : std::nullopt;
-}
-
-auto FindConvertButton(std::string_view json, std::string_view clickMessage)
-        -> std::optional<JsonObjectRange> {
-    std::vector<std::size_t> objectStack;
-    for (std::size_t position = 0; position < json.size();) {
-        if (json[position] == '"') {
-            std::size_t afterKey{};
-            const auto stringValue = ReadJsonString(json, position,
-                json.size(), afterKey);
-            if (!stringValue) return std::nullopt;
-            if (*stringValue == "onClickMessage" && objectStack.size() >= 2) {
-                std::size_t valuePosition = afterKey;
-                SkipJsonWhitespace(json, valuePosition, json.size());
-                if (valuePosition < json.size()
-                        && json[valuePosition] == ':') {
-                    ++valuePosition;
-                    SkipJsonWhitespace(json, valuePosition, json.size());
-                    std::size_t afterValue{};
-                    const auto value = ReadJsonString(json, valuePosition,
-                        json.size(), afterValue);
-                    if (value && *value == clickMessage) {
-                        const std::size_t widgetStart =
-                            objectStack[objectStack.size() - 2];
-                        const auto widgetEnd = FindMatchingJsonBrace(json,
-                            widgetStart, json.size());
-                        if (!widgetEnd) return std::nullopt;
-                        const JsonObjectRange widget{widgetStart, *widgetEnd};
-                        const auto type = ReadDirectJsonString(json, widget,
-                            "type");
-                        if (type && *type == "ButtonWidget") {
-                            return widget;
-                        }
-                    }
-                }
-            }
-            position = afterKey;
-            continue;
-        }
-        if (json[position] == '{') {
-            objectStack.push_back(position);
-        } else if (json[position] == '}' && !objectStack.empty()) {
-            objectStack.pop_back();
-        }
-        ++position;
-    }
-    return std::nullopt;
-}
-
-auto FindInnermostArrayBefore(std::string_view json, std::size_t position)
-        -> std::optional<std::size_t> {
-    std::vector<std::size_t> arrayStack;
-    for (std::size_t cursor = 0; cursor < position;) {
-        if (json[cursor] == '"') {
-            std::size_t afterString{};
-            if (!ReadJsonString(json, cursor, position, afterString)) {
-                return std::nullopt;
-            }
-            cursor = afterString;
-            continue;
-        }
-        if (json[cursor] == '[') {
-            arrayStack.push_back(cursor);
-        } else if (json[cursor] == ']' && !arrayStack.empty()) {
-            arrayStack.pop_back();
-        }
-        ++cursor;
-    }
-    if (arrayStack.empty()) return std::nullopt;
-    return arrayStack.back();
-}
-
-auto FindMatchingJsonBracket(std::string_view json, std::size_t opening,
-        std::size_t limit) -> std::optional<std::size_t> {
-    if (opening >= limit || json[opening] != '[') return std::nullopt;
-    std::size_t depth{};
-    for (std::size_t position = opening; position < limit;) {
-        if (json[position] == '"') {
-            std::size_t afterString{};
-            if (!ReadJsonString(json, position, limit, afterString)) {
-                return std::nullopt;
-            }
-            position = afterString;
-            continue;
-        }
-        if (json[position] == '[') {
-            ++depth;
-        } else if (json[position] == ']' && --depth == 0) {
-            return position;
-        }
-        ++position;
-    }
-    return std::nullopt;
-}
-
-auto FindJsonArrayMember(std::string_view json, JsonObjectRange object,
-        std::string_view key) -> std::optional<JsonArrayRange> {
-    const auto member = FindDirectJsonMember(json, object, key);
-    if (!member || member->value >= object.end || json[member->value] != '[') {
-        return std::nullopt;
-    }
-    const auto end = FindMatchingJsonBracket(json, member->value,
-        object.end + 1);
-    if (!end) return std::nullopt;
-    return JsonArrayRange{member->value, *end};
-}
-
-auto IsJsonWhitespace(char value) noexcept -> bool {
-    return value == ' ' || value == '\t' || value == '\r' || value == '\n';
-}
-
-auto JsonIndentationAt(std::string_view json, std::size_t position)
-        -> std::string {
-    const std::size_t lineStart = json.rfind('\n', position);
-    const std::size_t indentationStart = lineStart == std::string_view::npos
-        ? 0 : lineStart + 1;
-    std::size_t indentationEnd = indentationStart;
-    while (indentationEnd < position
-            && (json[indentationEnd] == ' ' || json[indentationEnd] == '\t')) {
-        ++indentationEnd;
-    }
-    return std::string(json.substr(indentationStart,
-        indentationEnd - indentationStart));
-}
-
-auto ReindentJsonObject(std::string_view object,
-        std::string_view sourceIndent, std::string_view targetIndent,
-        std::string_view newline) -> std::string {
-    std::vector<std::string_view> lines;
-    for (std::size_t start = 0; start <= object.size();) {
-        const std::size_t end = object.find('\n', start);
-        const std::size_t lineEnd = end == std::string_view::npos
-            ? object.size() : end;
-        std::size_t contentEnd = lineEnd;
-        if (contentEnd > start && object[contentEnd - 1] == '\r') {
-            --contentEnd;
-        }
-        lines.push_back(object.substr(start, contentEnd - start));
-        if (end == std::string_view::npos) break;
-        start = end + 1;
-    }
-    if (lines.empty()) return {};
-
-    std::string formatted;
-    formatted.reserve(object.size() + targetIndent.size() * lines.size());
-    for (std::size_t index = 0; index < lines.size(); ++index) {
-        if (index != 0) formatted.append(newline);
-        formatted.append(targetIndent);
-        auto line = lines[index];
-        if (index != 0 && !sourceIndent.empty()
-                && line.starts_with(sourceIndent)) {
-            line.remove_prefix(sourceIndent.size());
-        }
-        formatted.append(line);
-    }
-    return formatted;
-}
-
-auto AppendJsonArrayObject(std::string& json, JsonArrayRange array,
-        std::string_view serializedObject,
-        std::string_view sourceIndent = {}) -> bool {
-    if (array.begin >= array.end || array.end >= json.size()
-            || json[array.begin] != '[' || json[array.end] != ']') {
-        return false;
-    }
-    std::size_t firstContent = array.begin + 1;
-    SkipJsonWhitespace(json, firstContent, array.end);
-    const std::string newline = json.find("\r\n") != std::string::npos
-        ? "\r\n" : "\n";
-    const std::string arrayIndent = JsonIndentationAt(json, array.begin);
-    const std::string itemIndent = arrayIndent + "    ";
-    const std::string indentedObject = ReindentJsonObject(serializedObject,
-        sourceIndent, itemIndent, newline);
-    if (indentedObject.empty()) return false;
-
-    if (firstContent == array.end) {
-        json.insert(array.begin + 1, newline + indentedObject + newline
-            + arrayIndent);
-        return true;
-    }
-
-    std::size_t lastContent = array.end;
-    while (lastContent > array.begin + 1
-            && IsJsonWhitespace(json[lastContent - 1])) {
-        --lastContent;
-    }
-    if (lastContent <= array.begin + 1) return false;
-    json.insert(lastContent, "," + newline + indentedObject);
-    return true;
-}
-
-auto AppendJsonArrayMember(std::string& json, JsonObjectRange object,
-        std::string_view memberName, std::string_view serializedObject,
-        std::string_view sourceIndent = {})
-        -> bool {
-    if (FindDirectJsonMember(json, object, memberName)) {
-        const auto array = FindJsonArrayMember(json, object, memberName);
-        return array && AppendJsonArrayObject(json, *array, serializedObject,
-            sourceIndent);
-    }
-    if (object.begin >= object.end || object.end >= json.size()
-            || json[object.end] != '}') {
-        return false;
-    }
-
-    std::size_t insertion = object.end;
-    while (insertion > object.begin + 1
-            && IsJsonWhitespace(json[insertion - 1])) {
-        --insertion;
-    }
-    const bool hasMembers = insertion > object.begin + 1
-        && json[insertion - 1] != '{';
-    const std::string newline = json.find("\r\n") != std::string::npos
-        ? "\r\n" : "\n";
-    const std::string objectIndent = JsonIndentationAt(json, object.begin);
-    const std::string memberIndent = objectIndent + "    ";
-    const std::string childIndent = memberIndent + "    ";
-    const std::string indentedObject = ReindentJsonObject(serializedObject,
-        sourceIndent, childIndent, newline);
-    if (indentedObject.empty()) return false;
-
-    std::string addition = hasMembers ? "," : "";
-    addition += newline + memberIndent + "\"" + std::string(memberName)
-        + "\": [" + newline + indentedObject
-        + newline + memberIndent + "]";
-    json.insert(insertion, addition);
-    return true;
-}
-
-auto InsertJsonArrayObjectAfter(std::string& json, JsonObjectRange object,
-        std::string_view serializedObject) -> bool {
-    const auto arrayOpening = FindInnermostArrayBefore(json, object.begin);
-    if (!arrayOpening) return false;
-    const auto arrayEnd = FindMatchingJsonBracket(json, *arrayOpening,
-        json.size());
-    if (!arrayEnd || object.end >= *arrayEnd) return false;
-
-    const std::size_t lineStart = json.rfind('\n', object.begin);
-    const std::size_t indentationStart = lineStart == std::string::npos
-        ? 0 : lineStart + 1;
-    std::string indentation = json.substr(indentationStart,
-        object.begin - indentationStart);
-    if (indentation.find_first_not_of(" \t") != std::string::npos) {
-        indentation.clear();
-    }
-    const std::string newline = json.find("\r\n") != std::string::npos
-        ? "\r\n" : "\n";
-
-    std::size_t afterObject = object.end + 1;
-    SkipJsonWhitespace(json, afterObject, *arrayEnd);
-    if (afterObject < *arrayEnd && json[afterObject] == ',') {
-        json.insert(afterObject + 1, newline + indentation
-            + std::string(serializedObject) + ",");
-        return true;
-    }
-    if (afterObject != *arrayEnd) return false;
-    json.insert(object.end + 1, "," + newline + indentation
-        + std::string(serializedObject));
-    return true;
-}
-
-auto JsonScalarEnd(std::string_view json, std::size_t start,
-        std::size_t limit) noexcept -> std::optional<std::size_t> {
-    if (start >= limit) return std::nullopt;
-    if (json[start] == '"') {
-        std::size_t after{};
-        if (!ReadJsonString(json, start, limit, after)) return std::nullopt;
-        return after;
-    }
-    std::size_t end = start;
-    while (end < limit && json[end] != ',' && json[end] != '}'
-            && json[end] != ']') {
-        ++end;
-    }
-    while (end > start && (json[end - 1] == ' ' || json[end - 1] == '\t'
-            || json[end - 1] == '\r' || json[end - 1] == '\n')) {
-        --end;
-    }
-    return end > start ? std::optional<std::size_t>(end) : std::nullopt;
-}
-
-auto ReadNamedWidgetRectCoordinate(std::string_view json,
-        std::string_view widgetName, std::string_view coordinate)
-        -> std::optional<std::int32_t> {
-    const auto widget = FindNamedJsonObject(json, widgetName);
-    if (!widget) return std::nullopt;
-    const auto fields = FindJsonObjectMember(json, *widget, "fields");
-    if (!fields) return std::nullopt;
-    const auto rect = FindJsonObjectMember(json, *fields, "rect");
-    if (!rect) return std::nullopt;
-    const auto member = FindDirectJsonMember(json, *rect, coordinate);
-    if (!member) return std::nullopt;
-    const auto end = JsonScalarEnd(json, member->value, rect->end);
-    if (!end) return std::nullopt;
-    std::int32_t value{};
-    const auto parsed = std::from_chars(json.data() + member->value,
-        json.data() + *end, value);
-    if (parsed.ec != std::errc{} || parsed.ptr != json.data() + *end) {
-        return std::nullopt;
-    }
-    return value;
-}
-
-auto SetNamedWidgetRectPosition(std::string& json,
-        std::string_view widgetName, std::int32_t x,
-        std::int32_t y) -> bool {
-    const auto setCoordinate = [&](std::string_view coordinate,
-            std::int32_t value) -> bool {
-        const auto widget = FindNamedJsonObject(json, widgetName);
-        if (!widget) return false;
-        const auto fields = FindJsonObjectMember(json, *widget, "fields");
-        if (!fields) return false;
-        const auto rect = FindJsonObjectMember(json, *fields, "rect");
-        if (!rect) return false;
-        const auto member = FindDirectJsonMember(json, *rect, coordinate);
-        if (!member) return false;
-        const auto end = JsonScalarEnd(json, member->value, rect->end);
-        if (!end) return false;
-        const std::string replacement = std::to_string(value);
-        if (std::string_view(json).substr(member->value,
-                *end - member->value) != replacement) {
-            json.replace(member->value, *end - member->value, replacement);
-        }
-        return true;
-    };
-    return setCoordinate("x", x) && setCoordinate("y", y);
-}
-
-auto RemoveNamedJsonObject(std::string& json, std::string_view name) -> bool;
-
-auto NestBatchLabelUnderCheckbox(std::string& json) -> bool {
-    constexpr std::string_view CheckboxName =
-        "ultimate_scrapper_batch_toggle";
-    constexpr std::string_view LabelName = "ultimate_scrapper_batch_label";
-    const auto checkbox = FindNamedJsonObject(json, CheckboxName);
-    const auto label = FindNamedJsonObject(json, LabelName);
-    if (!checkbox || !label) return true;
-
-    const auto children = FindJsonArrayMember(json, *checkbox, "children");
-    if (children && label->begin > children->begin
-            && label->end < children->end) {
-        return true;
-    }
-    if (FindDirectJsonMember(json, *checkbox, "children") && !children) {
-        return false;
-    }
-
-    const auto checkboxX = ReadNamedWidgetRectCoordinate(json,
-        CheckboxName, "x");
-    const auto checkboxY = ReadNamedWidgetRectCoordinate(json,
-        CheckboxName, "y");
-    const auto labelX = ReadNamedWidgetRectCoordinate(json, LabelName, "x");
-    const auto labelY = ReadNamedWidgetRectCoordinate(json, LabelName, "y");
-    if (!checkboxX || !checkboxY || !labelX || !labelY) return false;
-
-    const std::int64_t relativeX = static_cast<std::int64_t>(*labelX)
-        - *checkboxX;
-    const std::int64_t relativeY = static_cast<std::int64_t>(*labelY)
-        - *checkboxY;
-    if (relativeX < std::numeric_limits<std::int32_t>::min()
-            || relativeX > std::numeric_limits<std::int32_t>::max()
-            || relativeY < std::numeric_limits<std::int32_t>::min()
-            || relativeY > std::numeric_limits<std::int32_t>::max()
-            || !SetNamedWidgetRectPosition(json, LabelName,
-                static_cast<std::int32_t>(relativeX),
-                static_cast<std::int32_t>(relativeY))) {
-        return false;
-    }
-
-    const auto relativeLabel = FindNamedJsonObject(json, LabelName);
-    if (!relativeLabel) return false;
-    const std::string labelIndent = JsonIndentationAt(json,
-        relativeLabel->begin);
-    const std::string serializedLabel(json.substr(relativeLabel->begin,
-        relativeLabel->end - relativeLabel->begin + 1));
-    if (!RemoveNamedJsonObject(json, LabelName)) return false;
-    const auto updatedCheckbox = FindNamedJsonObject(json, CheckboxName);
-    return updatedCheckbox && AppendJsonArrayMember(json, *updatedCheckbox,
-        "children", serializedLabel, labelIndent);
-}
-
-auto SetNamedWidgetVisible(std::string& json, std::string_view widgetName,
-        bool visible) -> bool {
-    const auto widget = FindNamedJsonObject(json, widgetName);
-    if (!widget) return false;
-    const auto fields = FindJsonObjectMember(json, *widget, "fields");
-    if (!fields) return false;
-    const auto visibility = FindDirectJsonMember(json, *fields, "visible");
-    const std::string replacement = visible ? "true" : "false";
-    if (visibility) {
-        const auto tokenEnd = JsonScalarEnd(json, visibility->value, fields->end);
-        if (!tokenEnd) return false;
-        if (std::string_view(json).substr(visibility->value,
-                *tokenEnd - visibility->value) != replacement) {
-            json.replace(visibility->value, *tokenEnd - visibility->value,
-                replacement);
-        }
-        return true;
-    }
-    if (visible) return true;
-
-    const auto firstMember = FindDirectJsonMember(json, *fields, "rect");
-    if (!firstMember) return false;
-    const std::size_t lineStart = json.rfind('\n', firstMember->key);
-    const std::size_t indentationStart = lineStart == std::string::npos
-        ? fields->begin + 1 : lineStart + 1;
-    const std::string prefix = json.substr(indentationStart,
-        firstMember->key - indentationStart);
-    const bool memberStartsLine = std::all_of(prefix.begin(), prefix.end(),
-        [](char character) {
-            return character == ' ' || character == '\t' || character == '\r';
-        });
-    const std::string newline = lineStart != std::string::npos
-            && lineStart > 0 && json[lineStart - 1] == '\r'
-        ? "\r\n" : "\n";
-    std::string visibilityMember = "\"visible\": " + replacement + ",";
-    if (memberStartsLine) {
-        visibilityMember += newline + prefix;
-    } else {
-        // Some user layouts keep a label's fields object on one line. Keep
-        // valid JSON by separating the injected member with a space there.
-        visibilityMember += ' ';
-    }
-    json.insert(firstMember->key, visibilityMember);
-    return true;
-}
-
-auto SetBatchCheckboxVisibility(std::string& json, bool visible) -> bool {
-    constexpr std::array<std::string_view, 2> widgetNames{
-        "ultimate_scrapper_batch_toggle",
-        "ultimate_scrapper_batch_label"
-    };
-    for (const auto widgetName : widgetNames) {
-        // Keep user layouts that intentionally omit either widget untouched.
-        if (!FindNamedJsonObject(json, widgetName)) continue;
-        if (!SetNamedWidgetVisible(json, widgetName, visible)) return false;
-    }
-    return true;
-}
-
-auto SetNamedWidgetString(std::string& json, std::string_view widgetName,
-        std::string_view memberName, std::string_view value) -> bool {
-    const auto widget = FindNamedJsonObject(json, widgetName);
-    if (!widget) return false;
-    const auto fields = FindJsonObjectMember(json, *widget, "fields");
-    if (!fields) return false;
-    const auto member = FindDirectJsonMember(json, *fields, memberName);
-    if (!member) return false;
-    std::size_t afterValue{};
-    if (!ReadJsonString(json, member->value, fields->end, afterValue)) {
-        return false;
-    }
-    const std::string replacement = "\"" + std::string(value) + "\"";
-    if (std::string_view(json).substr(member->value,
-            afterValue - member->value) != replacement) {
-        json.replace(member->value, afterValue - member->value, replacement);
-    }
-    return true;
-}
-
-auto RemoveNamedJsonObject(std::string& json, std::string_view name) -> bool {
-    const auto object = FindNamedJsonObject(json, name);
-    if (!object) return true;
-
-    std::size_t afterObject = object->end + 1;
-    SkipJsonWhitespace(json, afterObject, json.size());
-    if (afterObject < json.size() && json[afterObject] == ',') {
-        json.erase(object->begin, afterObject - object->begin + 1);
-    } else {
-        std::size_t beforeObject = object->begin;
-        while (beforeObject > 0 && (json[beforeObject - 1] == ' '
-                || json[beforeObject - 1] == '\t'
-                || json[beforeObject - 1] == '\r'
-                || json[beforeObject - 1] == '\n')) {
-            --beforeObject;
-        }
-        if (beforeObject > 0 && json[beforeObject - 1] == ',') {
-            const std::size_t eraseBegin = beforeObject - 1;
-            json.erase(eraseBegin, object->end + 1 - eraseBegin);
-        } else {
-            json.erase(object->begin, object->end + 1 - object->begin);
-        }
-    }
-    return !FindNamedJsonObject(json, name).has_value();
-}
-
-auto InjectSeparateButton(std::string& json, bool cubeLayout) -> bool {
-    if (FindNamedJsonObject(json, "ultimate_scrapper_transmute")) return true;
-
-    constexpr std::string_view CubeButton = R"json({
-    "type": "ButtonWidget", "name": "ultimate_scrapper_transmute",
-    "fields": {
-        "rect": { "x": 641, "y": 975 },
-        "filename": "PANEL\\Vendors\\RepairAll_Button",
-        "tooltipString": "Salvage",
-        "hoveredFrame": 2,
-        "sound": "cursor_convert_item",
-        "onClickMessage": "HoradricCubePanelMessage:Convert:UltimateScrapper"
-    }
-})json";
-    constexpr std::string_view StashButton = R"json({
-    "type": "ButtonWidget", "name": "ultimate_scrapper_transmute",
-    "fields": {
-        "rect": { "x": 801, "y": 1410 },
-        "filename": "PANEL\\Vendors\\RepairAll_Button",
-        "tooltipString": "Salvage",
-        "hoveredFrame": 2,
-        "sound": "cursor_convert_item",
-        "onClickMessage": "BankPanelMessage:Convert:UltimateScrapper"
-    }
-})json";
-    const auto convertButton = FindConvertButton(json,
-        cubeLayout ? "HoradricCubePanelMessage:Convert"
-            : "BankPanelMessage:Convert");
-    if (!convertButton) return false;
-    return InsertJsonArrayObjectAfter(json, *convertButton,
-        cubeLayout ? CubeButton : StashButton);
-}
-
-auto SyncExistingBatchCheckbox(std::string& json, bool cubeLayout) -> bool {
-    if (!FindNamedJsonObject(json, "ultimate_scrapper_batch_toggle")) {
-        return true;
-    }
-    // Convert is a native, registered UI message. A made-up command name
-    // causes D2RLoader's message parser to assert before listeners run.
-    const std::string target = cubeLayout
-        ? "HoradricCubePanelMessage" : "BankPanelMessage";
-    return SetNamedWidgetString(json, "ultimate_scrapper_batch_toggle",
-            "onClickMessage",
-            target + ":Convert:UltimateScrapperBatch")
-        && NestBatchLabelUnderCheckbox(json);
-}
-
-auto InjectBatchCheckbox(std::string& json, bool cubeLayout,
-        bool nativeButtonMode) -> bool {
-    constexpr std::string_view BatchCheckbox = R"json({
-    "type": "ToggleButtonWidget", "name": "ultimate_scrapper_batch_toggle",
-    "fields": {
-        "rect": { "x": 545, "y": 1088, "width": 64, "height": 64 },
-        "sound": "cursor_menu_select_hd",
-        "filename": "Lobby\\CreateGame\\CreateGame_AdvancedCheckbox",
-        "untoggledFrame": 0,
-        "untoggledPressedFrame": 1,
-        "untoggledHoveredFrame": 3,
-        "untoggledDisabledFrame": 2,
-        "toggledFrame": 4,
-        "toggledPressedFrame": 5,
-        "toggledHoveredFrame": 6,
-        "tooltipString": "Process each matching input item separately",
-        "onClickMessage": "HoradricCubePanelMessage:Convert:UltimateScrapperBatch"
-    }
-})json";
-    constexpr std::string_view BatchLabel = R"json({"type":"TextBoxWidget","name":"ultimate_scrapper_batch_label",
-	"fields":{
-		"visible": true, "rect":{"x":-55,"y":42,"width":180,"height":64},
-		"text":"Batch scrap",
-		"style":{"fontColor":"$PanelTitleColor",
-		"pointSize":"$SmallPanelFontSize",
-		"alignment":{"v":"center","h":"left"},
-		"dropShadow":"$DefaultDropShadow"}}}
-)json";
-
-    auto checkbox = FindNamedJsonObject(json,
-        "ultimate_scrapper_batch_toggle");
-    if (!checkbox) {
-        const auto existingButton = FindNamedJsonObject(json,
-            "ultimate_scrapper_transmute");
-        const std::string convertMessage = cubeLayout
-            ? "HoradricCubePanelMessage:Convert"
-            : "BankPanelMessage:Convert";
-        const auto anchor = existingButton
-            ? existingButton : FindConvertButton(json, convertMessage);
-        if (!anchor || !InsertJsonArrayObjectAfter(json, *anchor,
-                BatchCheckbox)) {
-            return false;
-        }
-        checkbox = FindNamedJsonObject(json,
-            "ultimate_scrapper_batch_toggle");
-        if (!checkbox) return false;
-        const std::int32_t defaultX = cubeLayout
-            ? nativeButtonMode ? 545 : 663 : 825;
-        const std::int32_t defaultY = cubeLayout ? 1088
-            : nativeButtonMode ? 1402 : 1530;
-        if (!SetNamedWidgetRectPosition(json,
-                "ultimate_scrapper_batch_toggle", defaultX, defaultY)) {
-            return false;
-        }
-    }
-    if (!FindNamedJsonObject(json, "ultimate_scrapper_batch_label")) {
-        if (!AppendJsonArrayMember(json, *checkbox, "children", BatchLabel)) {
-            return false;
-        }
-    }
-    return SyncExistingBatchCheckbox(json, cubeLayout);
-}
-
-auto FindActiveLayoutFile(const wchar_t* fileName) -> std::filesystem::path {
-    if (Context == nullptr || Context->modDirectory == nullptr
-            || Context->modDirectory[0] == L'\0') {
-        return {};
-    }
-    std::vector<std::filesystem::path> roots{
-        std::filesystem::path(Context->modDirectory)};
-    const auto configPath = ConfigPath();
-    if (!configPath.empty()) {
-        const auto modRoot = configPath.parent_path().parent_path().parent_path();
-        if (std::find(roots.begin(), roots.end(), modRoot) == roots.end()) {
-            roots.push_back(modRoot);
-        }
-    }
-
-    std::filesystem::path modFolder;
-    if (Context->activeMod != nullptr && Context->activeMod[0] != '\0') {
-        std::string modName(Context->activeMod);
-        if (modName.find_first_of("/\\:") != std::string::npos) {
-            modName.clear();
-        }
-        if (!modName.empty()
-                && (modName.size() < 4
-                    || modName.substr(modName.size() - 4) != ".mpq")) {
-            modName += ".mpq";
-        }
-        if (!modName.empty()) {
-            std::u8string modNameUtf8;
-            modNameUtf8.reserve(modName.size());
-            for (const unsigned char character : modName) {
-                modNameUtf8.push_back(static_cast<char8_t>(character));
-            }
-            modFolder = std::filesystem::path(modNameUtf8);
-        }
-    }
-
-    for (const auto& root : roots) {
-        std::vector<std::filesystem::path> candidates;
-        if (!modFolder.empty()) {
-            candidates.push_back(root / modFolder / L"data" / L"global"
-                / L"ui" / L"layouts" / fileName);
-        }
-        candidates.push_back(root / L"data" / L"global" / L"ui"
-            / L"layouts" / fileName);
-        for (const auto& candidate : candidates) {
-            std::error_code error;
-            if (std::filesystem::is_regular_file(candidate, error) && !error) {
-                return candidate;
-            }
-        }
-    }
-    return {};
-}
-
-auto ReadTextFile(const std::filesystem::path& path)
-        -> std::optional<std::string> {
-    try {
-        std::ifstream input(path, std::ios::binary);
-        if (!input.is_open()) return std::nullopt;
-        std::string contents(std::istreambuf_iterator<char>(input), {});
-        if (input.bad()) return std::nullopt;
-        return contents;
-    } catch (...) {
-        return std::nullopt;
-    }
-}
-
-auto StoreTextAtomically(const std::filesystem::path& path,
-        const std::string& contents) noexcept -> bool {
-    try {
-        std::error_code error;
-        std::filesystem::create_directories(path.parent_path(), error);
-        if (error) return false;
-        std::filesystem::path temporaryPath = path;
-        temporaryPath += L".ultimate-scrapper.tmp";
-        error.clear();
-        (void)std::filesystem::remove(temporaryPath, error);
-        std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
-        if (!output.is_open()) return false;
-        output.write(contents.data(),
-            static_cast<std::streamsize>(contents.size()));
-        output.close();
-        if (!output) {
-            std::filesystem::remove(temporaryPath, error);
-            return false;
-        }
-        if (!MoveFileExW(temporaryPath.c_str(), path.c_str(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-            std::filesystem::remove(temporaryPath, error);
-            return false;
-        }
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
-auto EnsureOriginalLayoutBackup(const std::filesystem::path& path) noexcept
-        -> bool {
-    try {
-        std::filesystem::path backupPath = path;
-        backupPath += L".ultimate-scrapper.bak";
-        std::error_code error;
-        if (std::filesystem::exists(backupPath, error)) return !error;
-        error.clear();
-        std::filesystem::copy_file(path, backupPath,
-            std::filesystem::copy_options::none, error);
-        return !error;
-    } catch (...) {
-        return false;
-    }
-}
-
-struct LayoutVariantPaths {
-    std::filesystem::path native;
-    std::filesystem::path separate;
-};
-
-auto GetLayoutVariantPaths(const std::filesystem::path& layoutPath)
-        -> LayoutVariantPaths {
-    const auto configPath = ConfigPath();
-    if (configPath.empty() || configPath.parent_path().empty()) return {};
-    const auto variantDirectory = configPath.parent_path()
-        / L"ultimate-scrapper-layouts";
-    const auto baseName = layoutPath.stem().wstring();
-    const auto extension = layoutPath.extension().wstring();
-    return {
-        variantDirectory / (baseName + L".native" + extension),
-        variantDirectory / (baseName + L".separate" + extension),
-    };
-}
-
-auto HasAnyLayoutVariantJson(const std::filesystem::path& layoutPath) noexcept
-        -> bool {
-    try {
-        const auto variantPaths = GetLayoutVariantPaths(layoutPath);
-        if (variantPaths.native.empty()) return true;
-        std::error_code error;
-        if (!std::filesystem::exists(variantPaths.native.parent_path(), error)) {
-            return static_cast<bool>(error);
-        }
-        if (error) return true;
-        std::filesystem::directory_iterator entry(
-            variantPaths.native.parent_path(), error);
-        if (error) return true;
-        const std::filesystem::directory_iterator end;
-        for (; entry != end; entry.increment(error)) {
-            if (error) return true;
-            if (entry->is_regular_file(error)
-                    && entry->path().extension() == L".json") {
-                return true;
-            }
-            if (error) return true;
-        }
-        return static_cast<bool>(error);
-    } catch (...) {
-        return true;
-    }
-}
-
-auto NormalizeLayoutVariant(std::string& json, bool nativeButtonMode,
-        bool cubeLayout, bool addBatchCheckbox) -> bool {
-    if (nativeButtonMode) {
-        if (!RemoveNamedJsonObject(json, "ultimate_scrapper_transmute")) {
-            return false;
-        }
-        return !addBatchCheckbox
-            || InjectBatchCheckbox(json, cubeLayout, nativeButtonMode);
-    }
-    if (!InjectSeparateButton(json, cubeLayout)) return false;
-    return SetNamedWidgetVisible(json, "ultimate_scrapper_transmute", true)
-        && SetNamedWidgetString(json, "ultimate_scrapper_transmute",
-            "tooltipString", "Salvage")
-        && (!addBatchCheckbox
-            || InjectBatchCheckbox(json, cubeLayout, nativeButtonMode));
-}
-
-auto PrepareLayoutVariants(const std::filesystem::path& layoutPath,
-        LayoutVariantPaths& variantPaths, bool cubeLayout,
-        bool seedWhenEmpty, bool showBatchCheckboxes,
-        bool addBatchCheckboxes) noexcept -> bool {
-    if (layoutPath.empty()) return false;
-    try {
-        variantPaths = GetLayoutVariantPaths(layoutPath);
-        if (variantPaths.native.empty() || variantPaths.separate.empty()) {
-            return false;
-        }
-        std::error_code error;
-        std::filesystem::create_directories(
-            variantPaths.native.parent_path(), error);
-        if (error) return false;
-
-        const bool nativeVariantExists = std::filesystem::exists(
-            variantPaths.native, error);
-        if (error) return false;
-        const bool separateVariantExists = std::filesystem::exists(
-            variantPaths.separate, error);
-        if (error || nativeVariantExists != separateVariantExists) {
-            return false;
-        }
-
-        std::optional<std::string> nativeJson;
-        std::optional<std::string> separateJson;
-        if (nativeVariantExists) {
-            nativeJson = ReadTextFile(variantPaths.native);
-            separateJson = ReadTextFile(variantPaths.separate);
-            if (!nativeJson || !separateJson) return false;
-        }
-
-        if (!nativeVariantExists) {
-            if (!seedWhenEmpty) return false;
-            auto activeJson = ReadTextFile(layoutPath);
-            if (!activeJson || activeJson->empty()) return false;
-
-            std::string nativeBase = *activeJson;
-            std::string separateBase = *activeJson;
-            if (!NormalizeLayoutVariant(nativeBase, true, cubeLayout,
-                        addBatchCheckboxes)
-                    || !NormalizeLayoutVariant(separateBase, false,
-                        cubeLayout, addBatchCheckboxes)) {
-                return false;
-            }
-            if (!StoreTextAtomically(variantPaths.native, nativeBase)) {
-                return false;
-            }
-            if (!StoreTextAtomically(variantPaths.separate, separateBase)) {
-                std::filesystem::remove(variantPaths.native, error);
-                return false;
-            }
-            nativeJson = std::move(nativeBase);
-            separateJson = std::move(separateBase);
-        }
-
-        if (!nativeJson || nativeJson->empty() || !separateJson
-                || separateJson->empty()) {
-            return false;
-        }
-        const auto injectionMarker = variantPaths.native.parent_path()
-            / (cubeLayout ? L"batch-checkbox-injected.marker"
-                : L"stash-batch-checkbox-injected.marker");
-        const bool markerExists = std::filesystem::exists(
-            injectionMarker, error);
-        if (error) return false;
-        const std::string nativeBefore = *nativeJson;
-        const std::string separateBefore = *separateJson;
-        if (!markerExists && addBatchCheckboxes) {
-            if (!InjectBatchCheckbox(*nativeJson, cubeLayout, true)
-                    || !InjectBatchCheckbox(*separateJson, cubeLayout,
-                        false)) {
-                return false;
-            }
-        } else if (!SyncExistingBatchCheckbox(*nativeJson, cubeLayout)
-                || !SyncExistingBatchCheckbox(*separateJson, cubeLayout)) {
-            return false;
-        }
-        if (!SetBatchCheckboxVisibility(*nativeJson, showBatchCheckboxes)
-                || !SetBatchCheckboxVisibility(*separateJson,
-                    showBatchCheckboxes)) {
-            return false;
-        }
-
-        if (*nativeJson != nativeBefore
-                && !StoreTextAtomically(variantPaths.native, *nativeJson)) {
-            return false;
-        }
-        if (*separateJson != separateBefore
-                && !StoreTextAtomically(variantPaths.separate, *separateJson)) {
-            return false;
-        }
-        if (!markerExists && addBatchCheckboxes
-                && !StoreTextAtomically(injectionMarker,
-                "Batch checkbox was added to the layout variants.\n")) {
-            return false;
-        }
-        if (FindNamedJsonObject(*nativeJson,
-                    "ultimate_scrapper_transmute")
-                || !FindNamedJsonObject(*separateJson,
-                    "ultimate_scrapper_transmute")) {
-            return false;
-        }
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
-auto ApplyLayoutFile(const std::filesystem::path& path,
-        bool nativeButtonMode, bool cubeLayout,
-        bool seedWhenEmpty, bool showBatchCheckboxes,
-        bool addBatchCheckboxes) noexcept -> bool {
-    if (path.empty()) return false;
-    try {
-        LayoutVariantPaths variantPaths;
-        if (!EnsureOriginalLayoutBackup(path)
-                || !PrepareLayoutVariants(path, variantPaths, cubeLayout,
-                    seedWhenEmpty, showBatchCheckboxes,
-                    addBatchCheckboxes)) {
-            return false;
-        }
-        const auto& selectedPath = nativeButtonMode
-            ? variantPaths.native : variantPaths.separate;
-        auto selectedJson = ReadTextFile(selectedPath);
-        if (!selectedJson || selectedJson->empty()) return false;
-        if (!showBatchCheckboxes
-                && (!RemoveNamedJsonObject(*selectedJson,
-                        "ultimate_scrapper_batch_toggle")
-                    || !RemoveNamedJsonObject(*selectedJson,
-                        "ultimate_scrapper_batch_label"))) {
-            return false;
-        }
-        const auto activeJson = ReadTextFile(path);
-        if (activeJson && *activeJson == *selectedJson) return true;
-        return StoreTextAtomically(path, *selectedJson);
-    } catch (...) {
-        return false;
-    }
-}
-
-void ApplyButtonLayout() noexcept {
-    if (Context == nullptr) return;
-    const bool nativeButtonMode = Config.transmuteButtonMode
-        == TransmuteButtonMode::Native;
-    const bool showBatchCheckboxes = Config.showBatchCheckboxes
-        && !Config.batchScrapAlwaysOn;
-    const bool addBatchCheckboxes = !Config.batchScrapAlwaysOn;
-    try {
-        const auto cubeLayout = FindActiveLayoutFile(
-            L"horadriccubelayouthd.json");
-        const auto bankLayout = FindActiveLayoutFile(
-            L"bankexpansionlayouthd.json");
-        const auto seedProbe = !cubeLayout.empty() ? cubeLayout : bankLayout;
-        const bool seedWhenEmpty = !seedProbe.empty()
-            && !HasAnyLayoutVariantJson(seedProbe);
-        if (!cubeLayout.empty()) {
-            if (!ApplyLayoutFile(cubeLayout, nativeButtonMode, true,
-                    seedWhenEmpty, showBatchCheckboxes,
-                    addBatchCheckboxes)) {
-                Context->LogWarn("UltimateScrapper: could not select the configured cube button layout variant; check d2rloader/config/ultimate-scrapper-layouts and file permissions.");
-            } else {
-                Context->LogInfo(nativeButtonMode
-                    ? "UltimateScrapper: Native cube button layout variant is active."
-                    : "UltimateScrapper: Separate cube button layout variant is active.");
-            }
-        }
-        if (!bankLayout.empty()) {
-            if (!ApplyLayoutFile(bankLayout, nativeButtonMode, false,
-                    seedWhenEmpty, showBatchCheckboxes,
-                    addBatchCheckboxes)) {
-                Context->LogWarn("UltimateScrapper: could not select the configured stash button layout variant; check d2rloader/config/ultimate-scrapper-layouts and file permissions.");
-            } else {
-                Context->LogInfo(nativeButtonMode
-                    ? "UltimateScrapper: Native stash button layout variant is active."
-                    : "UltimateScrapper: Separate stash button layout variant is active.");
-            }
-        }
-    } catch (...) {
-        Context->LogWarn("UltimateScrapper: could not inspect active layout JSON files for the selected button mode.");
-    }
-}
-
-auto ReadInteger(const toml::table& table, std::string_view key,
-        std::uint32_t minimum, std::uint32_t maximum,
-        std::uint32_t& destination, std::string& error) -> bool {
-    const auto* node = table.get(key);
-    if (node == nullptr) return true;
-    const auto value = node->value<std::int64_t>();
-    if (!value || *value < minimum || *value > maximum) {
-        error = std::string(key) + " must be an integer from "
-            + std::to_string(minimum) + " through " + std::to_string(maximum);
-        return false;
-    }
-    destination = static_cast<std::uint32_t>(*value);
-    return true;
-}
-
-auto ReadCustomItemLevel(const toml::table& table,
-        CustomSettings& destination, std::string& error) -> bool {
-    const auto* node = table.get("item-level");
-    if (node == nullptr) return true;
-    if (const auto level = node->value<std::int64_t>()) {
-        if (*level < 1 || *level > 99) {
-            error = "ultimate-scrapper.custom.item-level must be an integer from 1 through 99";
-            return false;
-        }
-        destination.itemLevel = static_cast<std::uint32_t>(*level);
-        return true;
-    }
-    error = "ultimate-scrapper.custom.item-level must be an integer from 1 through 99";
-    return false;
-}
-
-auto ReadWeight(const toml::table& table, std::string_view key,
-        double& destination, std::string& error) -> bool {
-    const auto* node = table.get(key);
-    if (node == nullptr) return true;
-    double value{};
-    if (const auto floating = node->value<double>()) {
-        value = *floating;
-    } else if (const auto integer = node->value<std::int64_t>()) {
-        value = static_cast<double>(*integer);
-    } else {
-        error = std::string(key) + " must be a non-negative number";
-        return false;
-    }
-    if (!std::isfinite(value) || value < 0.0 || value > 1.0e12) {
-        error = std::string(key) + " must be finite and between 0 and 1e12";
-        return false;
-    }
-    destination = value;
-    return true;
-}
-
-auto ParseItemCode(std::string_view text, std::uint32_t& destination) noexcept -> bool {
-    if (text.size() < 3 || text.size() > 4) return false;
-    std::array<char, 4> codeChars{' ', ' ', ' ', ' '};
-    for (std::size_t index = 0; index < text.size(); ++index) {
-        const unsigned char character = static_cast<unsigned char>(text[index]);
-        if (character < 0x21 || character > 0x7E) return false;
-        codeChars[index] = static_cast<char>(character);
-    }
-    destination = D2RL::Items::MakeItemCode(
-        codeChars[0], codeChars[1], codeChars[2], codeChars[3]);
-    return true;
-}
-
-auto ParseItemTypeCode(std::string_view text,
-        std::uint32_t& destination) noexcept -> bool {
-    if (text.empty() || text.size() > 4) return false;
-    D2RL::Inventory::ItemTypeFourCC itemType{};
-    for (std::size_t index = 0; index < text.size(); ++index) {
-        const unsigned char character = static_cast<unsigned char>(text[index]);
-        if (character < 0x21 || character > 0x7E) return false;
-        itemType.value[index] = static_cast<char>(character);
-    }
-    destination = PackItemTypeCode(itemType);
-    return true;
-}
-
-auto ParseItemQuality(std::string_view text,
-        D2RL::Items::Quality& destination) noexcept -> bool {
-    if (text == "inferior") destination = D2RL::Items::Quality::Inferior;
-    else if (text == "normal") destination = D2RL::Items::Quality::Normal;
-    else if (text == "superior") destination = D2RL::Items::Quality::Superior;
-    else if (text == "magic") destination = D2RL::Items::Quality::Magic;
-    else if (text == "set") destination = D2RL::Items::Quality::Set;
-    else if (text == "rare") destination = D2RL::Items::Quality::Rare;
-    else if (text == "unique") destination = D2RL::Items::Quality::Unique;
-    else if (text == "crafted") destination = D2RL::Items::Quality::Crafted;
-    else return false;
-    return true;
-}
-
-auto TrimInputText(std::string_view text) noexcept -> std::string_view {
-    while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
-        text.remove_prefix(1);
-    }
-    while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) {
-        text.remove_suffix(1);
-    }
-    return text;
-}
-
-auto LowerAscii(std::string_view text) -> std::string {
-    std::string lowered(text);
-    for (char& character : lowered) {
-        if (character >= 'A' && character <= 'Z') {
-            character = static_cast<char>(character - 'A' + 'a');
-        }
-    }
-    return lowered;
-}
-
-auto ParseRuneNumber(std::string_view text, std::uint32_t& runeNumber) noexcept
-        -> bool {
-    if (text.size() != 3 || text[0] != 'r'
-            || text[1] < '0' || text[1] > '9'
-            || text[2] < '0' || text[2] > '9') {
-        return false;
-    }
-    runeNumber = static_cast<std::uint32_t>(text[1] - '0') * 10U
-        + static_cast<std::uint32_t>(text[2] - '0');
-    return runeNumber >= 1 && runeNumber <= RuneCount;
-}
-
-auto ParseCustomOutputCode(std::string_view text, CustomOutputEntry& entry,
-        std::string& error) -> bool {
-    const std::string lowered = LowerAscii(text);
-    const std::string_view selector(lowered);
-    if (selector == "gem" || selector.starts_with("gem:")) {
-        if (selector == "gem") {
-            for (std::size_t sizeIndex = 0;
-                    sizeIndex < GemSizeCount; ++sizeIndex) {
-                for (const std::string_view gemCode : GemCodes[sizeIndex]) {
-                    std::uint32_t parsedCode{};
-                    if (!ParseItemCode(gemCode, parsedCode)) return false;
-                    entry.selectorCodes[entry.selectorCodeCount++] = parsedCode;
-                }
-            }
-            return true;
-        }
-
-        const std::string_view sizeName = selector.substr(4);
-        for (std::size_t sizeIndex = 0;
-                sizeIndex < GemSizeCount; ++sizeIndex) {
-            if (sizeName != GemSizeNames[sizeIndex]) continue;
-            for (const std::string_view gemCode : GemCodes[sizeIndex]) {
-                std::uint32_t parsedCode{};
-                if (!ParseItemCode(gemCode, parsedCode)) return false;
-                entry.selectorCodes[entry.selectorCodeCount++] = parsedCode;
-            }
-            return true;
-        }
-        error = "custom gem selector must be 'gem' or 'gem:chipped', 'gem:flawed', 'gem:normal', 'gem:flawless', or 'gem:perfect'";
-        return false;
-    }
-
-    if (selector == "rune" || selector.starts_with("rune:")) {
-        std::uint32_t firstRune = 1;
-        std::uint32_t lastRune = RuneCount;
-        if (selector != "rune") {
-            const std::string_view range = TrimInputText(selector.substr(5));
-            const std::size_t separator = range.find('-');
-            if (separator == std::string_view::npos) {
-                if (!ParseRuneNumber(TrimInputText(range), firstRune)) {
-                    error = "custom rune selector must use rune, rune:rNN, or an inclusive range such as rune:r01-r10 (r01 through r33)";
-                    return false;
-                }
-                lastRune = firstRune;
-            } else if (range.find('-', separator + 1) != std::string_view::npos
-                    || !ParseRuneNumber(TrimInputText(range.substr(0, separator)), firstRune)
-                    || !ParseRuneNumber(TrimInputText(range.substr(separator + 1)), lastRune)
-                    || firstRune > lastRune) {
-                error = "custom rune selector must use rune, rune:rNN, or an inclusive ascending range such as rune:r01-r10 (r01 through r33)";
-                return false;
-            }
-        }
-        for (std::uint32_t runeNumber = firstRune;
-                runeNumber <= lastRune; ++runeNumber) {
-            entry.selectorCodes[entry.selectorCodeCount++] = MakeRuneCode(runeNumber);
-        }
-        return true;
-    }
-
-    if (text.empty() || text.size() > 4) {
-        error = "custom item code must be a one- to four-character D2 item code, 'gem' selector, or 'rune' selector";
-        return false;
-    }
-    std::array<char, 4> codeChars{' ', ' ', ' ', ' '};
-    for (std::size_t index = 0; index < text.size(); ++index) {
-        const unsigned char character = static_cast<unsigned char>(text[index]);
-        if (character < 0x21 || character > 0x7E) {
-            error = "custom item codes may contain only visible ASCII characters";
-            return false;
-        }
-        codeChars[index] = static_cast<char>(character);
-    }
-    entry.code = D2RL::Items::MakeItemCode(codeChars[0], codeChars[1],
-        codeChars[2], codeChars[3]);
-    return true;
-}
-
-auto ParseInputRuleList(const toml::array& inputArray,
-        InputRuleList& destination) -> bool {
-    if (inputArray.empty() || inputArray.size() > MaximumCubeItems) {
-        return false;
-    }
-    destination.itemCount = inputArray.size();
-    for (std::size_t index = 0; index < destination.itemCount; ++index) {
-        const auto inputText = inputArray[index].value<std::string>();
-        if (!inputText) return false;
-
-        const std::string_view text = TrimInputText(*inputText);
-        const std::size_t comma = text.find(',');
-        const std::string_view code = TrimInputText(text.substr(0, comma));
-        InputRule& rule = destination.items[index];
-        if (code == "any") {
-            rule.anyCode = true;
-        } else if (code.starts_with("type:")) {
-            TypeRuleRequested = true;
-            const std::string_view typeCode = TrimInputText(code.substr(5));
-            if (!ParseItemTypeCode(typeCode, rule.itemTypeCode)
-                    || !ItemTypeData.available
-                    || !ItemTypeData.knownTypeCodes.contains(rule.itemTypeCode)) {
-                return false;
-            }
-            rule.matchesItemType = true;
-        } else if (!ParseItemCode(code, destination.items[index].code)) {
-            return false;
-        }
-
-        if (comma != std::string_view::npos) {
-            if (text.find(',', comma + 1) != std::string_view::npos) return false;
-            const std::string_view qualityText = TrimInputText(text.substr(comma + 1));
-            if (!ParseItemQuality(qualityText, rule.quality)) {
-                return false;
-            }
-            rule.hasQuality = true;
-        }
-    }
-    return true;
-}
-
-auto ParseInputRules(const toml::table& section,
-        InputSettings& destination) -> bool {
-    destination = InputSettings{};
-    const auto* inputNode = section.get("input");
-    const auto* input = inputNode == nullptr ? nullptr : inputNode->as_table();
-    if (input == nullptr) return false;
-
-    const auto* inputsNode = input->get("inputs");
-    if (inputsNode == nullptr) return false;
-    destination.usingDefaultRules = false;
-    destination.valid = false;
-
-    const auto* inputs = inputsNode->as_array();
-    if (inputs == nullptr || inputs->size() > MaximumInputLists) {
-        return false;
-    }
-    const bool hasNestedLists = !inputs->empty()
-        && (*inputs)[0].as_array() != nullptr;
-
-    // A single empty string is the TOML sentinel for the default one
-    // Unique/Set input recipe. Other empty or malformed entries stay invalid.
-    if (!hasNestedLists && inputs->size() == 1) {
-        const auto placeholder = (*inputs)[0].value<std::string>();
-        if (placeholder && TrimInputText(*placeholder).empty()) {
-            destination = InputSettings{};
-            return true;
-        }
-    }
-
-    InputSettings parsed;
-    parsed.usingDefaultRules = false;
-    parsed.valid = true;
-    if (hasNestedLists) {
-        parsed.listCount = inputs->size();
-        for (std::size_t listIndex = 0; listIndex < parsed.listCount; ++listIndex) {
-            const auto* inputArray = (*inputs)[listIndex].as_array();
-            if (inputArray == nullptr
-                    || !ParseInputRuleList(*inputArray, parsed.lists[listIndex])) {
-                return false;
-            }
-        }
-    } else {
-        parsed.listCount = 1;
-        if (!ParseInputRuleList(*inputs, parsed.lists[0])) {
-            return false;
-        }
-    }
-
-    destination = parsed;
-    return true;
-}
-
-auto TrimTableField(std::string_view field) noexcept -> std::string_view {
-    while (!field.empty()
-            && (field.front() == ' ' || field.front() == '\t'
-                || field.front() == '\r' || field.front() == '\n')) {
-        field.remove_prefix(1);
-    }
-    while (!field.empty()
-            && (field.back() == ' ' || field.back() == '\t'
-                || field.back() == '\r' || field.back() == '\n')) {
-        field.remove_suffix(1);
-    }
-    return field;
-}
-
-auto SplitTableRow(std::string_view line)
-        -> std::vector<std::string_view> {
-    std::vector<std::string_view> fields;
-    std::size_t start{};
-    for (;;) {
-        const std::size_t tab = line.find('\t', start);
-        if (tab == std::string_view::npos) {
-            fields.push_back(TrimTableField(line.substr(start)));
-            break;
-        }
-        fields.push_back(TrimTableField(line.substr(start, tab - start)));
-        start = tab + 1;
-    }
-    return fields;
-}
-
-auto ReadTableHeaders(std::ifstream& input,
-        std::vector<std::string>& headers) -> bool {
-    std::string line;
-    if (!std::getline(input, line)) return false;
-    std::string_view headerLine(line);
-    if (headerLine.starts_with("\xEF\xBB\xBF")) headerLine.remove_prefix(3);
-    const auto fields = SplitTableRow(headerLine);
-    headers.reserve(fields.size());
-    for (std::string_view field : fields) {
-        std::string name(field);
-        for (char& character : name) {
-            if (character >= 'A' && character <= 'Z') {
-                character = static_cast<char>(character - 'A' + 'a');
-            }
-        }
-        headers.push_back(std::move(name));
-    }
-    return !headers.empty();
-}
-
-auto FindTableColumn(const std::vector<std::string>& headers,
-        std::string_view name) -> std::optional<std::size_t> {
-    for (std::size_t index = 0; index < headers.size(); ++index) {
-        if (headers[index] == name) return index;
-    }
-    return std::nullopt;
-}
-
-auto TableFieldAt(const std::vector<std::string_view>& fields,
-        std::size_t index) noexcept -> std::string_view {
-    return index < fields.size() ? fields[index] : std::string_view{};
-}
-
-auto IsEnabledTableFlag(std::string_view value) noexcept -> bool {
-    return value == "1" || value == "true" || value == "yes";
-}
-
-auto IsQuestTableValue(std::string_view value) noexcept -> bool {
-    if (value.empty()) return false;
-    std::int32_t questId{};
-    const auto parsed = std::from_chars(value.data(),
-        value.data() + value.size(), questId);
-    return parsed.ec == std::errc{}
-        && parsed.ptr == value.data() + value.size()
-        && questId > 0;
-}
-
-auto CleanTableToken(std::string_view value) noexcept -> std::string_view {
-    value = TrimTableField(value);
-    if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
-        value.remove_prefix(1);
-        value.remove_suffix(1);
-    }
-    return TrimTableField(value);
-}
-
-auto LoadItemTypeDefinitions(const std::filesystem::path& path,
-        ItemTypeCatalog& catalog) -> bool {
-    std::ifstream input(path, std::ios::binary);
-    if (!input.is_open()) return false;
-    std::vector<std::string> headers;
-    if (!ReadTableHeaders(input, headers)) return false;
-    const auto codeColumn = FindTableColumn(headers, "code");
-    const auto equiv1Column = FindTableColumn(headers, "equiv1");
-    const auto equiv2Column = FindTableColumn(headers, "equiv2");
-    const auto magicColumn = FindTableColumn(headers, "magic");
-    const auto rareColumn = FindTableColumn(headers, "rare");
-    const auto normalColumn = FindTableColumn(headers, "normal");
-    if (!codeColumn || !equiv1Column || !equiv2Column
-            || !magicColumn || !rareColumn || !normalColumn) return false;
-
-    std::size_t rowCount{};
-    std::string line;
-    while (std::getline(input, line)) {
-        const auto fields = SplitTableRow(line);
-        const std::string_view codeText = TableFieldAt(fields, *codeColumn);
-        std::uint32_t code{};
-        if (codeText == "xxx" || !ParseItemTypeCode(codeText, code)) continue;
-        if (++rowCount > MaximumItemTypeRows) return false;
-
-        std::array<std::uint32_t, 2> parents{};
-        const std::array<std::size_t, 2> parentColumns{
-            *equiv1Column, *equiv2Column};
-        for (std::size_t index = 0; index < parentColumns.size(); ++index) {
-            const std::string_view parentText = TableFieldAt(fields, parentColumns[index]);
-            if (parentText != "xxx") {
-                (void)ParseItemTypeCode(parentText, parents[index]);
-            }
-        }
-        catalog.knownTypeCodes.insert(code);
-        catalog.parentTypes[code] = parents;
-        catalog.qualityFlagsByType[code] = {
-            .magic = IsEnabledTableFlag(TableFieldAt(fields, *magicColumn)),
-            .rare = IsEnabledTableFlag(TableFieldAt(fields, *rareColumn)),
-            .normal = IsEnabledTableFlag(TableFieldAt(fields, *normalColumn)),
-        };
-    }
-    return !input.bad() && rowCount != 0;
-}
-
-auto LoadItemTypeMemberships(const std::filesystem::path& path,
-        ItemTypeCatalog& catalog, std::size_t& totalRows,
-        bool equipmentTable) -> bool {
-    std::ifstream input(path, std::ios::binary);
-    if (!input.is_open()) return false;
-    std::vector<std::string> headers;
-    if (!ReadTableHeaders(input, headers)) return false;
-    const auto codeColumn = FindTableColumn(headers, "code");
-    const auto typeColumn = FindTableColumn(headers, "type");
-    const auto type2Column = FindTableColumn(headers, "type2");
-    const auto questColumn = FindTableColumn(headers, "quest");
-    if (!codeColumn || !typeColumn) return false;
-    const auto normCodeColumn = FindTableColumn(headers, "normcode");
-    const auto uberCodeColumn = FindTableColumn(headers, "ubercode");
-    const auto ultraCodeColumn = FindTableColumn(headers, "ultracode");
-
-    std::size_t tableRows{};
-    std::string line;
-    while (std::getline(input, line)) {
-        const auto fields = SplitTableRow(line);
-        std::uint32_t itemCode{};
-        if (!ParseItemCode(TableFieldAt(fields, *codeColumn), itemCode)) continue;
-        if (++tableRows > MaximumItemRows || ++totalRows > MaximumItemRows) {
-            return false;
-        }
-
-        if (questColumn
-                && IsQuestTableValue(TableFieldAt(fields, *questColumn))) {
-            catalog.questItemCodes.insert(itemCode);
-        }
-
-        auto& memberships = catalog.itemTypesByItemCode[itemCode];
-        const std::array<std::optional<std::size_t>, 2> typeColumns{
-            typeColumn, type2Column};
-        for (const auto column : typeColumns) {
-            if (!column) continue;
-            std::uint32_t typeCode{};
-            const std::string_view typeText = TableFieldAt(fields, *column);
-            if (ParseItemTypeCode(typeText, typeCode)
-                    && catalog.knownTypeCodes.contains(typeCode)
-                    && std::find(memberships.begin(), memberships.end(), typeCode)
-                        == memberships.end()) {
-                memberships.push_back(typeCode);
-                catalog.directItemTypesByItemCode[itemCode].push_back(typeCode);
-            }
-        }
-        if (equipmentTable) {
-            catalog.equipmentItemCodes.insert(itemCode);
-            std::uint32_t family = itemCode;
-            std::vector<std::uint32_t> familyCodes{itemCode};
-            const std::array<std::optional<std::size_t>, 3> familyColumns{
-                normCodeColumn, uberCodeColumn, ultraCodeColumn};
-            for (const auto column : familyColumns) {
-                if (!column) continue;
-                std::uint32_t familyCode{};
-                if (ParseItemCode(TableFieldAt(fields, *column), familyCode)) {
-                    familyCodes.push_back(familyCode);
-                    if (column == normCodeColumn) family = familyCode;
-                }
-            }
-            for (const std::uint32_t familyCode : familyCodes) {
-                catalog.itemFamilyByItemCode[familyCode] = family;
-            }
-        }
-    }
-    return !input.bad() && tableRows != 0;
-}
-
-auto LoadQualityRecordCodes(const std::filesystem::path& path,
-        std::string_view codeColumnName,
-        std::unordered_set<std::uint32_t>& destination) -> bool {
-    std::ifstream input(path, std::ios::binary);
-    if (!input.is_open()) return false;
-    std::vector<std::string> headers;
-    if (!ReadTableHeaders(input, headers)) return false;
-    const auto codeColumn = FindTableColumn(headers, codeColumnName);
-    const auto disabledColumn = FindTableColumn(headers, "disabled");
-    const auto spawnableColumn = FindTableColumn(headers, "spawnable");
-    if (!codeColumn) return false;
-
-    std::size_t rowCount{};
-    std::string line;
-    while (std::getline(input, line)) {
-        const auto fields = SplitTableRow(line);
-        const std::string_view codeText = TableFieldAt(fields, *codeColumn);
-        std::uint32_t code{};
-        if (!ParseItemCode(codeText, code)) continue;
-        if (++rowCount > MaximumItemRows) return false;
-        if (disabledColumn && IsEnabledTableFlag(
-                TableFieldAt(fields, *disabledColumn))) {
-            continue;
-        }
-        const std::string_view spawnable = spawnableColumn
-            ? TableFieldAt(fields, *spawnableColumn) : std::string_view{};
-        if (!spawnable.empty() && !IsEnabledTableFlag(spawnable)) continue;
-        destination.insert(code);
-    }
-    return !input.bad() && rowCount != 0;
-}
-
-auto LoadCraftQualityRules(const std::filesystem::path& path,
-        ItemTypeCatalog& catalog) -> bool {
-    std::ifstream input(path, std::ios::binary);
-    if (!input.is_open()) return false;
-    std::vector<std::string> headers;
-    if (!ReadTableHeaders(input, headers)) return false;
-    const auto enabledColumn = FindTableColumn(headers, "enabled");
-    const auto outputColumn = FindTableColumn(headers, "output");
-    const auto inputColumn = FindTableColumn(headers, "input 1");
-    if (!outputColumn || !inputColumn) return false;
-
-    std::size_t rowCount{};
-    std::string line;
-    while (std::getline(input, line)) {
-        const auto fields = SplitTableRow(line);
-        const std::string_view output = CleanTableToken(
-            TableFieldAt(fields, *outputColumn));
-        bool createsCrafted{};
-        std::size_t outputStart{};
-        for (;;) {
-            const std::size_t comma = output.find(',', outputStart);
-            if (CleanTableToken(output.substr(outputStart,
-                    comma == std::string_view::npos
-                        ? output.size() - outputStart : comma - outputStart)) == "crf") {
-                createsCrafted = true;
-                break;
-            }
-            if (comma == std::string_view::npos) break;
-            outputStart = comma + 1;
-        }
-        if (!createsCrafted) continue;
-        if (++rowCount > MaximumItemRows) return false;
-        if (enabledColumn) {
-            const std::string_view enabled = TableFieldAt(fields, *enabledColumn);
-            if (!enabled.empty() && !IsEnabledTableFlag(enabled)) continue;
-        }
-
-        const std::string_view inputSpec = CleanTableToken(
-            TableFieldAt(fields, *inputColumn));
-        const std::size_t comma = inputSpec.find(',');
-        const std::string_view selector = CleanTableToken(
-            inputSpec.substr(0, comma));
-        bool upgraded{};
-        std::size_t optionStart = comma == std::string_view::npos
-            ? inputSpec.size() : comma + 1;
-        while (optionStart < inputSpec.size()) {
-            const std::size_t optionEnd = inputSpec.find(',', optionStart);
-            const std::string_view option = CleanTableToken(inputSpec.substr(
-                optionStart, optionEnd == std::string_view::npos
-                    ? inputSpec.size() - optionStart : optionEnd - optionStart));
-            upgraded = upgraded || option == "upg";
-            if (optionEnd == std::string_view::npos) break;
-            optionStart = optionEnd + 1;
-        }
-
-        std::uint32_t code{};
-        if (ParseItemTypeCode(selector, code)
-                && catalog.knownTypeCodes.contains(code)) {
-            catalog.craftedItemTypeCodes.insert(code);
-        } else if (ParseItemCode(selector, code)) {
-            catalog.craftedItemCodes.insert(code);
-            if (upgraded) {
-                const auto family = catalog.itemFamilyByItemCode.find(code);
-                catalog.craftedItemFamilies.insert(family == catalog.itemFamilyByItemCode.end()
-                    ? code : family->second);
-            }
-        }
-    }
-    return !input.bad() && rowCount != 0;
-}
-
-auto AddQualityIfMissing(std::vector<D2RL::Items::Quality>& qualities,
-        D2RL::Items::Quality quality) -> void {
-    if (std::find(qualities.begin(), qualities.end(), quality) == qualities.end()) {
-        qualities.push_back(quality);
-    }
-}
-
-auto HasCraftedQuality(const ItemTypeCatalog& catalog,
-        std::uint32_t itemCode,
-        const std::vector<std::uint32_t>& itemTypes) noexcept -> bool {
-    if (catalog.craftedItemCodes.contains(itemCode)) return true;
-    for (const std::uint32_t typeCode : itemTypes) {
-        if (catalog.craftedItemTypeCodes.contains(typeCode)) return true;
-    }
-    const auto family = catalog.itemFamilyByItemCode.find(itemCode);
-    return family != catalog.itemFamilyByItemCode.end()
-        && catalog.craftedItemFamilies.contains(family->second);
-}
-
-auto BuildOutputQualityCatalog(ItemTypeCatalog& catalog) -> void {
-    for (const auto& [itemCode, itemTypes] : catalog.itemTypesByItemCode) {
-        std::vector<D2RL::Items::Quality> qualities;
-        if (catalog.equipmentItemCodes.contains(itemCode)) {
-            AddQualityIfMissing(qualities, D2RL::Items::Quality::Inferior);
-            AddQualityIfMissing(qualities, D2RL::Items::Quality::Normal);
-            AddQualityIfMissing(qualities, D2RL::Items::Quality::Superior);
-            AddQualityIfMissing(qualities, D2RL::Items::Quality::Magic);
-            AddQualityIfMissing(qualities, D2RL::Items::Quality::Rare);
-        } else {
-            const auto directTypes = catalog.directItemTypesByItemCode.find(itemCode);
-            if (directTypes != catalog.directItemTypesByItemCode.end()) {
-                for (const std::uint32_t typeCode : directTypes->second) {
-                    const auto flags = catalog.qualityFlagsByType.find(typeCode);
-                    if (flags == catalog.qualityFlagsByType.end()) continue;
-                    if (flags->second.normal) {
-                        AddQualityIfMissing(qualities, D2RL::Items::Quality::Normal);
-                    }
-                    if (flags->second.magic) {
-                        AddQualityIfMissing(qualities, D2RL::Items::Quality::Magic);
-                    }
-                    if (flags->second.rare) {
-                        AddQualityIfMissing(qualities, D2RL::Items::Quality::Rare);
-                    }
-                }
-            }
-            // Most miscellaneous items have one fixed Normal quality. ItemTypes
-            // explicitly marks jewelry and charms that can instead be Magic/Rare.
-            if (qualities.empty()) {
-                AddQualityIfMissing(qualities, D2RL::Items::Quality::Normal);
-            }
-        }
-        if (catalog.setItemCodes.contains(itemCode)) {
-            AddQualityIfMissing(qualities, D2RL::Items::Quality::Set);
-        }
-        if (catalog.uniqueItemCodes.contains(itemCode)) {
-            AddQualityIfMissing(qualities, D2RL::Items::Quality::Unique);
-        }
-        if (HasCraftedQuality(catalog, itemCode, itemTypes)) {
-            AddQualityIfMissing(qualities, D2RL::Items::Quality::Crafted);
-        }
-        catalog.validQualitiesByItemCode.emplace(itemCode, std::move(qualities));
-    }
-}
-
-struct ItemTypeExcelDirectory {
-    std::filesystem::path path;
-    bool compilerFallback{};
-};
-
-auto FindItemTypeExcelDirectory() -> std::optional<ItemTypeExcelDirectory> {
-    std::vector<std::filesystem::path> roots;
-    if (Context != nullptr && Context->modDirectory != nullptr
-            && Context->modDirectory[0] != L'\0') {
-        roots.emplace_back(Context->modDirectory);
-    }
-    const auto configPath = ConfigPath();
-    if (!configPath.empty()) {
-        roots.push_back(configPath.parent_path().parent_path());
-    }
-
-    std::vector<std::filesystem::path> candidates;
-    std::string modName;
-    if (Context != nullptr && Context->activeMod != nullptr) {
-        modName = Context->activeMod;
-        if (modName.find_first_of("/\\:") != std::string::npos) {
-            modName.clear();
-        }
-        if (!modName.empty()
-                && (modName.size() < 4
-                    || modName.substr(modName.size() - 4) != ".mpq")) {
-            modName += ".mpq";
-        }
-    }
-
-    for (const auto& root : roots) {
-        if (!modName.empty()) {
-            std::u8string modNameUtf8;
-            modNameUtf8.reserve(modName.size());
-            for (const unsigned char character : modName) {
-                modNameUtf8.push_back(static_cast<char8_t>(character));
-            }
-            candidates.push_back(root / std::filesystem::path(modNameUtf8)
-                / L"data" / L"global" / L"excel");
-        }
-        candidates.push_back(root / L"data" / L"global" / L"excel");
-    }
-
-    std::vector<std::filesystem::path> compilerFallbackCandidates;
-    for (const auto& root : roots) {
-        const auto fallback = root / L"data" / L"compiler" / L"3.3.0"
-            / L"data" / L"global" / L"excel";
-        if (std::find(compilerFallbackCandidates.begin(),
-                    compilerFallbackCandidates.end(), fallback)
-                == compilerFallbackCandidates.end()) {
-            compilerFallbackCandidates.push_back(fallback);
-        }
-    }
-
-    constexpr std::array<const wchar_t*, 4> RequiredFiles{
-        L"itemtypes.txt", L"armor.txt", L"weapons.txt", L"misc.txt"};
-    const auto hasRequiredFiles = [&](const std::filesystem::path& candidate) {
-        bool complete = true;
-        for (const wchar_t* filename : RequiredFiles) {
-            std::error_code error;
-            if (!std::filesystem::is_regular_file(candidate / filename, error)
-                    || error) {
-                complete = false;
-                break;
-            }
-        }
-        return complete;
-    };
-    for (const auto& candidate : candidates) {
-        if (hasRequiredFiles(candidate)) return ItemTypeExcelDirectory{
-            .path = candidate,
-            .compilerFallback = false,
-        };
-    }
-    for (const auto& candidate : compilerFallbackCandidates) {
-        if (hasRequiredFiles(candidate)) return ItemTypeExcelDirectory{
-            .path = candidate,
-            .compilerFallback = true,
-        };
-    }
-    return std::nullopt;
-}
-
-auto LoadItemTypeCatalog(bool& usedCompilerFallback) noexcept -> bool {
-    ItemTypeData = {};
-    usedCompilerFallback = false;
-    try {
-        const auto excelDirectory = FindItemTypeExcelDirectory();
-        if (!excelDirectory) return false;
-
-        ItemTypeCatalog catalog;
-        if (!LoadItemTypeDefinitions(excelDirectory->path / L"itemtypes.txt", catalog)) {
-            return false;
-        }
-        std::size_t totalItemRows{};
-        if (!LoadItemTypeMemberships(excelDirectory->path / L"armor.txt",
-                    catalog, totalItemRows, true)
-                || !LoadItemTypeMemberships(excelDirectory->path / L"weapons.txt",
-                    catalog, totalItemRows, true)
-                || !LoadItemTypeMemberships(excelDirectory->path / L"misc.txt",
-                    catalog, totalItemRows, false)) {
-            return false;
-        }
-
-        (void)LoadQualityRecordCodes(excelDirectory->path / L"uniqueitems.txt",
-            "code", catalog.uniqueItemCodes);
-        (void)LoadQualityRecordCodes(excelDirectory->path / L"setitems.txt",
-            "item", catalog.setItemCodes);
-        (void)LoadCraftQualityRules(excelDirectory->path / L"cubemain.txt", catalog);
-
-        for (auto& [itemCode, memberships] : catalog.itemTypesByItemCode) {
-            (void)itemCode;
-            std::vector<std::uint32_t> expanded;
-            for (std::uint32_t typeCode : memberships) {
-                if (std::find(expanded.begin(), expanded.end(), typeCode)
-                        == expanded.end()) {
-                    expanded.push_back(typeCode);
-                }
-            }
-            for (std::size_t index = 0; index < expanded.size(); ++index) {
-                const auto parents = catalog.parentTypes.find(expanded[index]);
-                if (parents == catalog.parentTypes.end()) continue;
-                for (std::uint32_t parent : parents->second) {
-                    if (parent != 0 && catalog.knownTypeCodes.contains(parent)
-                            && std::find(expanded.begin(), expanded.end(), parent)
-                                == expanded.end()) {
-                        expanded.push_back(parent);
-                    }
-                }
-            }
-            memberships = std::move(expanded);
-        }
-        catalog.available = true;
-        BuildOutputQualityCatalog(catalog);
-        ItemTypeData = std::move(catalog);
-        usedCompilerFallback = excelDirectory->compilerFallback;
-        return true;
-    } catch (...) {
-        ItemTypeData = {};
-        return false;
-    }
-}
-
-auto ParseConfig(std::string_view text, Settings& destination,
-        std::string& error) -> bool {
-    try {
-        const auto root = toml::parse(text);
-        const auto* sectionNode = root.get("ultimate-scrapper");
-        if (sectionNode == nullptr) return true;
-        const auto* section = sectionNode->as_table();
-        if (section == nullptr) {
-            error = "ultimate-scrapper must be a TOML table";
-            return false;
-        }
-        (void)ParseInputRules(*section, destination.input);
-        if (const auto* modeNode = section->get("active-output-mode")) {
-            const auto mode = modeNode->value<std::string>();
-            if (!mode) {
-                error = "ultimate-scrapper.active-output-mode must be \"Runes\", \"Custom\", or \"Both\"";
-                return false;
-            }
-            if (*mode == "Runes") {
-                destination.activeOutputMode = OutputMode::Runes;
-            } else if (*mode == "Custom") {
-                destination.activeOutputMode = OutputMode::Custom;
-            } else if (*mode == "Both") {
-                destination.activeOutputMode = OutputMode::Both;
-            } else {
-                error = "ultimate-scrapper.active-output-mode must be \"Runes\", \"Custom\", or \"Both\"";
-                return false;
-            }
-        }
-        if (const auto* buttonModeNode = section->get("transmute-button-mode")) {
-            const auto buttonMode = buttonModeNode->value<std::string>();
-            if (!buttonMode) {
-                error = "ultimate-scrapper.transmute-button-mode must be \"Native\" or \"Separate\"";
-                return false;
-            }
-            if (*buttonMode == "Native") {
-                destination.transmuteButtonMode = TransmuteButtonMode::Native;
-            } else if (*buttonMode == "Separate") {
-                destination.transmuteButtonMode = TransmuteButtonMode::Separate;
-            } else {
-                error = "ultimate-scrapper.transmute-button-mode must be \"Native\" or \"Separate\"";
-                return false;
-            }
-        }
-        if (const auto* batchCheckboxNode = section->get(
-                "show-batch-checkboxes")) {
-            const auto showBatchCheckboxes = batchCheckboxNode->value<bool>();
-            if (!showBatchCheckboxes) {
-                error = "ultimate-scrapper.show-batch-checkboxes must be true or false";
-                return false;
-            }
-            destination.showBatchCheckboxes = *showBatchCheckboxes;
-        }
-        if (const auto* batchAlwaysOnNode = section->get(
-                "batch-scrap-always-on")) {
-            const auto batchAlwaysOn = batchAlwaysOnNode->value<bool>();
-            if (!batchAlwaysOn) {
-                error = "ultimate-scrapper.batch-scrap-always-on must be true or false";
-                return false;
-            }
-            destination.batchScrapAlwaysOn = *batchAlwaysOn;
-        }
-
-        if (destination.activeOutputMode != OutputMode::Custom) {
-            if (!ReadInteger(*section, "failure-chance-percent", 0, 100,
-                    destination.runes.failureChancePercent, error)) {
-                return false;
-            }
-
-            const auto* countNode = section->get("output-count-weights");
-            if (countNode != nullptr) {
-                const auto* counts = countNode->as_table();
-                if (counts == nullptr) {
-                    error = "ultimate-scrapper.output-count-weights must be a table";
-                    return false;
-                }
-                if (!ReadInteger(*counts, "one", 0, 100,
-                        destination.runes.outputCountWeights[0], error)
-                        || !ReadInteger(*counts, "two", 0, 100,
-                        destination.runes.outputCountWeights[1], error)
-                        || !ReadInteger(*counts, "three", 0, 100,
-                        destination.runes.outputCountWeights[2], error)) {
-                    return false;
-                }
-            }
-            const std::uint32_t countWeightTotal = destination.runes.outputCountWeights[0]
-                + destination.runes.outputCountWeights[1] + destination.runes.outputCountWeights[2];
-            if (countWeightTotal != 100) {
-                error = "output-count-weights one, two, and three must sum to 100";
-                return false;
-            }
-
-            const auto* runeNode = section->get("rune-weights");
-            if (runeNode != nullptr) {
-                const auto* runeWeights = runeNode->as_table();
-                if (runeWeights == nullptr) {
-                    error = "ultimate-scrapper.rune-weights must be a table";
-                    return false;
-                }
-                for (std::size_t index = 0; index < RuneNames.size(); ++index) {
-                    if (!ReadWeight(*runeWeights, RuneNames[index],
-                            destination.runes.runeWeights[index], error)) {
-                        return false;
-                    }
-                }
-            }
-            for (const double weight : destination.runes.runeWeights) {
-                destination.runes.totalRuneWeight += weight;
-            }
-            if (!std::isfinite(destination.runes.totalRuneWeight)
-                    || destination.runes.totalRuneWeight <= 0.0) {
-                error = "at least one rune weight must be greater than zero";
-                return false;
-            }
-        }
-        if (destination.activeOutputMode != OutputMode::Runes) {
-            const auto* customNode = section->get("custom");
-            const auto* custom = customNode == nullptr ? nullptr : customNode->as_table();
-            if (custom == nullptr) {
-                error = "ultimate-scrapper.custom must be a table when Custom or Both mode is active";
-                return false;
-            }
-            if (!ReadInteger(*custom, "failure-chance-percent", 0, 100,
-                    destination.custom.failureChancePercent, error)
-                    || !ReadCustomItemLevel(*custom, destination.custom, error)) {
-                return false;
-            }
-            const auto* countNode = custom->get("output-count-weights");
-            if (countNode != nullptr) {
-                const auto* counts = countNode->as_table();
-                if (counts == nullptr) {
-                    error = "ultimate-scrapper.custom.output-count-weights must be a table";
-                    return false;
-                }
-                constexpr std::array<std::string_view, MaximumCustomRandomOutputs> CountNames{
-                    "one", "two", "three", "four", "five", "six",
-                    "seven", "eight", "nine", "ten", "eleven", "twelve",
-                };
-                for (std::size_t index = 0; index < CountNames.size(); ++index) {
-                    if (!ReadInteger(*counts, CountNames[index], 0, 100,
-                            destination.custom.outputCountWeights[index], error)) {
-                        return false;
-                    }
-                }
-            } else if (custom->get("output-count") != nullptr) {
-                std::uint32_t legacyOutputCount{};
-                if (!ReadInteger(*custom, "output-count", 1,
-                        MaximumCustomRandomOutputs, legacyOutputCount, error)) {
-                    error = "legacy custom output-count must be from 1 through 12; replace it with output-count-weights";
-                    return false;
-                }
-                destination.custom.outputCountWeights.fill(0);
-                destination.custom.outputCountWeights[legacyOutputCount - 1] = 100;
-            }
-            std::uint32_t customCountWeightTotal{};
-            for (const std::uint32_t weight : destination.custom.outputCountWeights) {
-                customCountWeightTotal += weight;
-            }
-            if (customCountWeightTotal != 100) {
-                error = "custom output-count-weights one through twelve must sum to 100";
-                return false;
-            }
-            const auto* itemsNode = custom->get("items");
-            const auto* items = itemsNode == nullptr ? nullptr : itemsNode->as_array();
-            if (items == nullptr || items->empty()) {
-                error = "ultimate-scrapper.custom.items must contain at least one item entry";
-                return false;
-            }
-            if (items->size() > destination.custom.items.size()) {
-                error = "ultimate-scrapper.custom.items may contain at most 64 entries";
-                return false;
-            }
-            for (const auto& itemNode : *items) {
-                const auto* item = itemNode.as_table();
-                if (item == nullptr) {
-                    error = "each ultimate-scrapper.custom.items entry must be a table";
-                    return false;
-                }
-                const auto* codeNode = item->get("code");
-                const auto codeText = codeNode == nullptr
-                    ? std::optional<std::string>{}
-                    : codeNode->value<std::string>();
-                if (!codeText || codeText->empty()
-                        || codeText->size() > MaximumCustomOutputCodeLength) {
-                    error = "each custom item code must be a one- to four-character D2 item code or a supported gem/rune selector";
-                    return false;
-                }
-
-                CustomOutputEntry& entry = destination.custom.items[destination.custom.itemCount];
-                if (!ParseCustomOutputCode(*codeText, entry, error)) return false;
-
-                const auto* qualityNode = item->get("quality");
-                const auto qualityText = qualityNode == nullptr
-                    ? std::optional<std::string>{}
-                    : qualityNode->value<std::string>();
-                if (qualityNode != nullptr && !qualityText) {
-                    error = "custom item quality must be a string (or blank)";
-                    return false;
-                }
-                const bool randomQuality = qualityNode == nullptr || qualityText->empty();
-                std::array<D2RL::Items::Quality, MaximumItemQualities> qualities{};
-                std::size_t qualityCount{};
-                if (!randomQuality) {
-                    std::string_view qualityList(*qualityText);
-                    std::size_t tokenStart{};
-                    for (;;) {
-                        const std::size_t comma = qualityList.find(',', tokenStart);
-                        const std::string_view token = TrimInputText(
-                            qualityList.substr(tokenStart,
-                                comma == std::string_view::npos
-                                    ? qualityList.size() - tokenStart
-                                    : comma - tokenStart));
-                        D2RL::Items::Quality parsedQuality{};
-                        if (token.empty() || qualityCount >= qualities.size()
-                                || !ParseItemQuality(token, parsedQuality)) {
-                            error = "custom quality must be blank or a comma-separated list of inferior, normal, superior, magic, set, rare, unique, or crafted";
-                            return false;
-                        }
-                        if (std::find(qualities.begin(),
-                                qualities.begin() + static_cast<std::ptrdiff_t>(qualityCount),
-                                parsedQuality) != qualities.begin()
-                                    + static_cast<std::ptrdiff_t>(qualityCount)) {
-                            error = "custom quality lists may not repeat a quality";
-                            return false;
-                        }
-                        qualities[qualityCount++] = parsedQuality;
-                        if (comma == std::string_view::npos) break;
-                        tokenStart = comma + 1;
-                    }
-                }
-
-                entry.qualities = qualities;
-                entry.qualityCount = qualityCount;
-                entry.randomQuality = randomQuality;
-                if (const auto* guaranteedNode = item->get("guaranteed")) {
-                    const auto guaranteed = guaranteedNode->value<bool>();
-                    if (!guaranteed) {
-                        error = "custom item guaranteed must be true or false";
-                        return false;
-                    }
-                    entry.guaranteed = *guaranteed;
-                }
-                if (!ReadInteger(*item, "quantity", 1, 5000, entry.quantity, error)
-                        || !ReadWeight(*item, "weight", entry.weight, error)) {
-                    return false;
-                }
-                if (entry.guaranteed) {
-                    ++destination.custom.guaranteedCount;
-                } else {
-                    destination.custom.totalWeight += entry.weight;
-                }
-                ++destination.custom.itemCount;
-            }
-            if (!std::isfinite(destination.custom.totalWeight)
-                    || destination.custom.totalWeight <= 0.0) {
-                error = "at least one non-guaranteed custom item weight must be greater than zero";
-                return false;
-            }
-            std::size_t maximumRandomOutputCount{};
-            for (std::size_t index = 0;
-                    index < destination.custom.outputCountWeights.size(); ++index) {
-                if (destination.custom.outputCountWeights[index] > 0) {
-                    maximumRandomOutputCount = index + 1;
-                }
-            }
-            if (destination.custom.guaranteedCount + maximumRandomOutputCount
-                    > MaximumCustomOutputs) {
-                error = "guaranteed custom outputs plus the maximum random output count may not exceed 64 items";
-                return false;
-            }
-        }
-        return true;
-    } catch (const std::exception& exception) {
-        error = exception.what();
-        return false;
-    }
-}
-
-auto LoadConfig() noexcept -> bool {
-    TypeRuleRequested = false;
-    std::string configStorage;
-    std::string_view text = DefaultConfig;
-    try {
-        const auto path = ConfigPath();
-        if (!path.empty()) {
-            std::error_code error;
-            if (!std::filesystem::exists(path, error) && !error) {
-                std::filesystem::create_directories(path.parent_path(), error);
-                if (!error) {
-                    std::ofstream output(path, std::ios::binary);
-                    if (output.is_open()) {
-                        output.write(DefaultConfig,
-                            static_cast<std::streamsize>(sizeof(DefaultConfig) - 1));
-                    }
-                }
-            }
-            error.clear();
-            if (std::filesystem::is_regular_file(path, error) && !error) {
-                std::ifstream input(path, std::ios::binary);
-                if (input.is_open()) {
-                    configStorage.assign(std::istreambuf_iterator<char>(input),
-                        std::istreambuf_iterator<char>());
-                    if (!input.bad()) text = configStorage;
-                } else {
-                    Context->LogWarn("UltimateScrapper: config could not be opened; embedded defaults will be used.");
-                }
-            }
-        }
-    } catch (...) {
-        Context->LogWarn("UltimateScrapper: config access failed; embedded defaults will be used.");
-    }
-
-    Settings parsed;
-    std::string error;
-    if (!ParseConfig(text, parsed, error)) {
-        const std::string message = "UltimateScrapper: invalid TOML config (" + error + ").";
-        Context->LogError(message.c_str());
-        return false;
-    }
-    Config = parsed;
-    if (!Config.input.valid) {
-        Context->LogWarn("UltimateScrapper: custom input rules are invalid; no cube inputs will be accepted. Check that every recipe contains 1 through 12 valid entries.");
-        if (TypeRuleRequested && !ItemTypeData.available) {
-            Context->LogWarn("UltimateScrapper: itemtype rules require itemtypes.txt, armor.txt, weapons.txt, and misc.txt in the active mod's data/global/excel folder or its d2rloader/data/compiler/3.3.0/data/global/excel fallback.");
-        }
-    } else if (Config.input.usingDefaultRules) {
-        Context->LogInfo("UltimateScrapper: no custom input list was found; defaulting to exactly one Unique or Set item in the cube.");
-    }
-    return true;
-}
-
-void ResetPending() noexcept {
-    Pending = {};
-    ExchangePending.store(false, std::memory_order_release);
-}
-
-void __cdecl ExecuteExchange(const D2RL::PluginContext* context, void*) noexcept {
-    const std::lock_guard<std::mutex> lock(PendingMutex);
-    if (context == nullptr || context != Context || !Active.load(std::memory_order_acquire)) {
-        ResetPending();
-        return;
-    }
-
-    CubeCollector cube;
-    const auto inventoryResult = ReadCubeItems(Pending.player, cube);
-    if (inventoryResult != D2RL::Inventory::Result::Success) {
-        char message[144]{};
-        (void)std::snprintf(message, sizeof(message),
-            "UltimateScrapper: could not re-read cube contents on the game thread (Inventory result=%u).",
-            static_cast<unsigned>(inventoryResult));
-        Context->LogWarn(message);
-        ResetPending();
-        return;
-    }
-    if (!MatchesPending(cube, Pending)) {
-        char message[160]{};
-        (void)std::snprintf(message, sizeof(message),
-            "UltimateScrapper: cube contents or an input item changed before the transaction (%u item(s), %u expected); no items were changed.",
-            static_cast<unsigned>(cube.count),
-            static_cast<unsigned>(Pending.itemCount));
-        Context->LogWarn(message);
-        ResetPending();
-        return;
-    }
-    for (std::size_t index = 0; index < cube.count; ++index) {
-        if (cube.items[index].handle == D2RL::InvalidItemHandle) {
-            Context->LogWarn("UltimateScrapper: an input item changed before the transaction; no items were changed.");
-            ResetPending();
-            return;
-        }
-    }
-
-    std::array<D2RL::Items::TransactionInput, MaximumCubeItems> inputs{};
-    for (std::size_t index = 0; index < cube.count; ++index) {
-        inputs[index] = {
-            .item = cube.items[index].handle,
-            .quantity = static_cast<std::uint32_t>(
-                std::max(cube.items[index].quantity, 1)),
-            .socketedItemPolicy = D2RL::Items::SocketedItemPolicy::DestroyContents,
-        };
-    }
-    std::array<D2RL::Items::ItemCreateSpec, MaximumCustomOutputs> outputs{};
-    std::array<D2RL::ItemHandle, MaximumCustomOutputs> outputItems{};
-    D2RL::Items::Transaction transaction{
-        .structSize = D2RL::Items::TransactionSize,
-        .flags = 0,
-        .player = Pending.player,
-        .inputCount = static_cast<std::uint32_t>(cube.count),
-        .outputCount = 0,
-        .inputs = inputs.data(),
-        .outputs = outputs.data(),
-        .outputItems = outputItems.data(),
-        .outputCapacity = MaximumCustomOutputs,
-        .reserved = 0,
-    };
-    D2RL::Items::TransactionResult result{
-        .structSize = D2RL::Items::TransactionResultSize,
-        .flags = 0,
-        .outputCount = 0,
-        .reserved = 0,
-    };
-
-    const bool processIndividually = Pending.processIndividually;
-    const OutputMode recipeOutputMode = processIndividually
-        ? OutputMode::Runes : ChooseOutputMode();
-    std::size_t outputCount{};
-    std::uint32_t failedInputCount{};
-    std::uint32_t successfulInputCount{};
-    const std::uint32_t attemptCount = processIndividually
-        ? static_cast<std::uint32_t>(cube.count) : 1U;
-    bool outputCapacityExceeded{};
-    for (std::uint32_t attempt = 0; attempt < attemptCount; ++attempt) {
-        const OutputMode outputMode = processIndividually
-            ? ChooseOutputMode() : recipeOutputMode;
-        const std::uint32_t failureChance = outputMode == OutputMode::Runes
-            ? Config.runes.failureChancePercent
-            : Config.custom.failureChancePercent;
-        const std::uint32_t failureRoll =
-            std::uniform_int_distribution<std::uint32_t>(1, 100)(RandomEngine);
-        if (failureRoll <= failureChance) {
-            ++failedInputCount;
-            continue;
-        }
-        ++successfulInputCount;
-        if (!AppendOutputsForMode(outputMode, outputs, outputCount)) {
-            outputCapacityExceeded = true;
-            break;
-        }
-    }
-
-    if (outputCapacityExceeded) {
-        Context->LogWarn("UltimateScrapper: this batch would exceed ItemService's output limit; no input items were changed.");
-        ResetPending();
-        return;
-    }
-
-    transaction.outputCount = static_cast<std::uint32_t>(outputCount);
-
-    const auto status = ItemService->executeTransaction(context, &transaction, &result);
-    if (status == D2RL::Items::Result::Success) {
-        char message[192]{};
-        if (processIndividually) {
-            (void)std::snprintf(message, sizeof(message),
-                "UltimateScrapper: batch processed %u input item(s) independently: %u failed, %u succeeded, %u output item(s) created.",
-                static_cast<unsigned>(cube.count), failedInputCount,
-                successfulInputCount, static_cast<unsigned>(outputCount));
-        } else if (failedInputCount != 0) {
-            const std::uint32_t failureChance = recipeOutputMode == OutputMode::Runes
-                ? Config.runes.failureChancePercent
-                : Config.custom.failureChancePercent;
-            (void)std::snprintf(message, sizeof(message),
-                "UltimateScrapper: recipe failed (%u%% chance); %u input item(s) and socket contents were consumed with no output.",
-                failureChance, static_cast<unsigned>(cube.count));
-        } else if (recipeOutputMode == OutputMode::Runes) {
-            (void)std::snprintf(message, sizeof(message),
-                "UltimateScrapper: transmuted %u configured input item(s) into %u random rune(s).",
-                static_cast<unsigned>(cube.count), static_cast<unsigned>(outputCount));
-        } else {
-            (void)std::snprintf(message, sizeof(message),
-                "UltimateScrapper: transmuted %u configured input item(s) into %u custom item(s).",
-                static_cast<unsigned>(cube.count), static_cast<unsigned>(outputCount));
-        }
-        Context->LogInfo(message);
-        if (result.outputCount != transaction.outputCount) {
-            Context->LogWarn("UltimateScrapper: ItemService committed the transaction but reported an unexpected output count.");
-        }
-    } else {
-        char message[176]{};
-        (void)std::snprintf(message, sizeof(message),
-            "UltimateScrapper: transaction rolled back (ItemService result=%u); the input item(s) were left untouched.",
-            static_cast<unsigned>(status));
-        Context->LogWarn(message);
-    }
-    ResetPending();
-}
-
-auto __cdecl OnUiMessage(const D2RL::PluginContext* context,
-        const D2RL::SharedEvents::UiMessageEvent* event, void*) noexcept
-        -> D2RL::SharedEvents::UiMessageAction {
-    if (context != Context || event == nullptr
-            || event->structSize < D2RL::SharedEvents::UiMessageEventRequiredSize
-            || event->target == nullptr || event->command == nullptr
-            || !Active.load(std::memory_order_acquire)) {
-        return D2RL::SharedEvents::UiMessageAction::Continue;
-    }
-
-    const std::string_view target(event->target);
-    const std::string_view command(event->command);
-    const std::string_view text = event->text != nullptr
-        ? std::string_view(event->text) : std::string_view{};
-    const bool isCubeOrStashTarget = target == ConvertTarget
-        || target == StashConvertTarget;
-    const bool batchToggleAction = isCubeOrStashTarget
-        && command == ConvertCommand && text == BatchToggleMarker;
-    if (batchToggleAction) {
-        if (Config.batchScrapAlwaysOn) {
-            BatchModeEnabled.store(true, std::memory_order_release);
-            return D2RL::SharedEvents::UiMessageAction::Consume;
-        }
-        bool current = BatchModeEnabled.load(std::memory_order_acquire);
-        while (!BatchModeEnabled.compare_exchange_weak(current, !current,
-                std::memory_order_acq_rel, std::memory_order_acquire)) {
-        }
-        Context->LogInfo(current
-            ? "UltimateScrapper: individual batch processing is disabled."
-            : "UltimateScrapper: individual batch processing is enabled.");
-        return D2RL::SharedEvents::UiMessageAction::Consume;
-    }
-
-    const bool pluginButtonAction = isCubeOrStashTarget
-        && command == ConvertCommand && text == ScrapperButtonMarker;
-    const bool nativeConvertAction = isCubeOrStashTarget
-        && command == ConvertCommand && !pluginButtonAction;
-    if (!pluginButtonAction && !nativeConvertAction) {
-        return D2RL::SharedEvents::UiMessageAction::Continue;
-    }
-
-    const bool nativeButtonMode = Config.transmuteButtonMode
-        == TransmuteButtonMode::Native;
-    if (nativeConvertAction && !nativeButtonMode) {
-        if (!ConvertMessageLogged.exchange(true, std::memory_order_acq_rel)) {
-            Context->LogInfo("UltimateScrapper: observed a native cube or stash Convert message; passing it through.");
-        }
-        return D2RL::SharedEvents::UiMessageAction::Continue;
-    }
-
-    const bool nativeFallback = nativeButtonMode;
-    if (pluginButtonAction
-            && !ScrapperButtonMessageLogged.exchange(true, std::memory_order_acq_rel)) {
-        Context->LogInfo("UltimateScrapper: observed the plugin transmute button action.");
-    }
-    if (nativeConvertAction
-            && !ConvertMessageLogged.exchange(true, std::memory_order_acq_rel)) {
-        Context->LogInfo("UltimateScrapper: Native button mode is checking configured inputs before passing unmatched recipes to D2R.");
-    }
-
-    D2RL::PlayerHandle player{D2RL::InvalidPlayerHandle};
-    if (InventoryService->getLocalPlayer(context, &player) != D2RL::Inventory::Result::Success
-            || player == D2RL::InvalidPlayerHandle) {
-        return nativeFallback ? D2RL::SharedEvents::UiMessageAction::Continue
-            : D2RL::SharedEvents::UiMessageAction::Consume;
-    }
-
-    CubeCollector cube;
-    if (ReadCubeItems(player, cube) != D2RL::Inventory::Result::Success) {
-        if (!MismatchMessageLogged.exchange(true, std::memory_order_acq_rel)) {
-            Context->LogWarn(nativeFallback
-                ? "UltimateScrapper: could not read cube contents in Native button mode; passing the action through to D2R."
-                : "UltimateScrapper: could not read cube contents; transmute action was blocked.");
-        }
-        return nativeFallback ? D2RL::SharedEvents::UiMessageAction::Continue
-            : D2RL::SharedEvents::UiMessageAction::Consume;
-    }
-    const bool batchModeRequested = BatchModeEnabled.load(
-        std::memory_order_acquire);
-    bool processIndividually{};
-    if (!MatchesConfiguredInputs(cube, batchModeRequested,
-            processIndividually)) {
-        if (!MismatchMessageLogged.exchange(true, std::memory_order_acq_rel)) {
-            Context->LogInfo(nativeFallback
-                ? "UltimateScrapper: no configured input recipe matched; passing the action through to D2R."
-                : "UltimateScrapper: no configured input recipe matched the cube contents.");
-        }
-        return nativeFallback ? D2RL::SharedEvents::UiMessageAction::Continue
-            : D2RL::SharedEvents::UiMessageAction::Consume;
-    }
-    for (std::size_t index = 0; index < cube.count; ++index) {
-        if (cube.items[index].handle == D2RL::InvalidItemHandle) {
-            return D2RL::SharedEvents::UiMessageAction::Consume;
-        }
-    }
-    if (ExchangePending.exchange(true, std::memory_order_acq_rel)) {
-        return D2RL::SharedEvents::UiMessageAction::Consume;
-    }
-    {
-        const std::lock_guard<std::mutex> lock(PendingMutex);
-        Pending = {};
-        Pending.player = player;
-        Pending.itemCount = cube.count;
-        Pending.batchModeRequested = batchModeRequested;
-        Pending.processIndividually = processIndividually;
-        for (std::size_t index = 0; index < cube.count; ++index) {
-            Pending.items[index] = cube.items[index];
-        }
-    }
-    if (ThreadService->runOnGameThread(context, ExecuteExchange, nullptr)
-            != D2RL::Threads::Result::Success) {
-        const std::lock_guard<std::mutex> lock(PendingMutex);
-        ResetPending();
-        Context->LogWarn("UltimateScrapper: could not schedule the transaction on the game thread.");
-        return D2RL::SharedEvents::UiMessageAction::Consume;
-    }
-    return D2RL::SharedEvents::UiMessageAction::Consume;
-}
-
-auto Initialize(const D2RL::PluginContext* context) -> bool {
-    BatchModeEnabled.store(false, std::memory_order_release);
-    if (context->QueryService(&InventoryService)
-            != D2RL::ServiceQueryResult::Success
-            || InventoryService == nullptr
-            || InventoryService->serviceSize < D2RL::InventoryServiceRequiredSize
-            || InventoryService->getLocalPlayer == nullptr
-            || InventoryService->forEachInventoryItem == nullptr) {
-        context->LogError("UltimateScrapper: D2RLoader InventoryService v1 is required.");
-        return false;
-    }
-    if (context->QueryService(&ItemService)
-            != D2RL::ServiceQueryResult::Success
-            || ItemService == nullptr
-            || ItemService->serviceSize < D2RL::ItemServiceRequiredSize
-            || ItemService->destroyItem == nullptr
-            || ItemService->executeTransaction == nullptr) {
-        context->LogError("UltimateScrapper: D2RLoader ItemService v1 transaction support is required.");
-        return false;
-    }
-    if (context->QueryService(&ThreadService)
-            != D2RL::ServiceQueryResult::Success
-            || ThreadService == nullptr
-            || ThreadService->serviceSize < D2RL::ThreadServiceRequiredSize
-            || ThreadService->runOnGameThread == nullptr) {
-        context->LogError("UltimateScrapper: D2RLoader game-thread service is required.");
-        return false;
-    }
-    if (context->QueryService(&EventService)
-            != D2RL::ServiceQueryResult::Success
-            || EventService == nullptr
-            || EventService->serviceSize < D2RL::SharedEventServiceRequiredSize
-            || EventService->registerUiMessageListener == nullptr
-            || EventService->unregisterUiMessageListener == nullptr) {
-        context->LogError("UltimateScrapper: D2RLoader shared UI-message service is required.");
-        return false;
-    }
-    bool usedCompilerFallback{};
-    (void)LoadItemTypeCatalog(usedCompilerFallback);
-    if (usedCompilerFallback) {
-        context->LogInfo("UltimateScrapper: active item tables are incomplete; using the base tables from d2rloader/data/compiler/3.3.0/data/global/excel.");
-    }
-    if (!ItemTypeData.available
-            || !ItemTypeData.knownTypeCodes.contains(QuestItemTypeCode)) {
-        context->LogWarn("UltimateScrapper: item tables are missing or do not define 'ques'; plugin recipes are disabled to prevent quest items from being scrapped.");
-    }
-    if (!LoadConfig()) return false;
-    BatchModeEnabled.store(Config.batchScrapAlwaysOn,
-        std::memory_order_release);
-    ApplyButtonLayout();
-
-    std::uint64_t seed = GetTickCount64()
-        ^ (static_cast<std::uint64_t>(GetCurrentProcessId()) << 32U);
-    try {
-        std::random_device random;
-        seed ^= (static_cast<std::uint64_t>(random()) << 32U) | random();
-    } catch (...) {
-    }
-    RandomEngine.seed(static_cast<std::mt19937::result_type>(seed ^ (seed >> 32U)));
-
-    const D2RL::SharedEvents::UiMessageListener listener{
-        .structSize = D2RL::SharedEvents::UiMessageListenerSize,
-        .flags = 0,
-        .priority = 10000,
-        .reserved = 0,
-        .callback = OnUiMessage,
-        .userData = nullptr,
-    };
-    if (EventService->registerUiMessageListener(context, &listener, &MessageHandle)
-            != D2RL::SharedEvents::Result::Success
-            || MessageHandle == D2RL::SharedEvents::InvalidHandle) {
-        context->LogError("UltimateScrapper: could not register for the Horadric Cube Convert action.");
-        return false;
-    }
-    Active.store(true, std::memory_order_release);
-    if (Config.activeOutputMode == OutputMode::Runes) {
-        context->LogInfo("UltimateScrapper 0.2.3 is ready in Runes mode; configured input items are accepted.");
-    } else if (Config.activeOutputMode == OutputMode::Custom) {
-        context->LogInfo("UltimateScrapper 0.2.3 is ready in Custom mode; configured input items are accepted.");
-    } else {
-        context->LogInfo("UltimateScrapper 0.2.3 is ready in Both mode; each transmute chooses Runes or Custom with equal probability.");
-    }
-    if (Config.transmuteButtonMode == TransmuteButtonMode::Native) {
-        context->LogInfo("UltimateScrapper: Native button mode is active; configured plugin recipes take priority on Convert, and unmatched contents pass to D2R.");
-    } else {
-        context->LogInfo("UltimateScrapper: Separate button mode is active; native Convert messages pass through and the marked button runs plugin recipes.");
-    }
-    if (Config.batchScrapAlwaysOn) {
-        context->LogInfo("UltimateScrapper: batch scrap is always enabled; its checkbox and label are omitted from the active layouts.");
-    }
-    return true;
-}
-
-void Shutdown() noexcept {
-    Active.store(false, std::memory_order_release);
-    if (Context != nullptr && EventService != nullptr
-            && MessageHandle != D2RL::SharedEvents::InvalidHandle
-            && EventService->unregisterUiMessageListener != nullptr) {
-        (void)EventService->unregisterUiMessageListener(Context, MessageHandle);
-    }
-    MessageHandle = D2RL::SharedEvents::InvalidHandle;
-    const std::lock_guard<std::mutex> lock(PendingMutex);
-    ResetPending();
-    RandomEngine.seed(0);
-    ConvertMessageLogged.store(false, std::memory_order_release);
-    ScrapperButtonMessageLogged.store(false, std::memory_order_release);
-    MismatchMessageLogged.store(false, std::memory_order_release);
-    ItemTypeData = {};
-    TypeRuleRequested = false;
-    EventService = nullptr;
-    ThreadService = nullptr;
-    ItemService = nullptr;
-    InventoryService = nullptr;
-}
-
-} // namespace
-
-D2RL_PLUGIN_EXPORT auto D2RLoaderGetPluginInfo() noexcept -> const D2RL::PluginInfo* {
-    return &Info;
-}
-
-D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) noexcept -> bool {
-    Shutdown();
-    if (!D2RL::HasContext(context) || context->abiVersion != D2RL_PLUGIN_ABI_VERSION) return false;
-    Context = context;
-    bool initialized{};
-    try {
-        initialized = Initialize(context);
-    } catch (...) {
-        Context->LogError("UltimateScrapper: plugin initialization failed.");
-    }
-    if (!initialized) {
-        Shutdown();
-        Context = nullptr;
-        return false;
-    }
-    return true;
-}
-
-D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
-    Shutdown();
-    Context = nullptr;
-}
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éíãõé:-jZ.¶›­–)Ş³R6–æ6ÇVFRÄC%$ÅÇVv–âö’æƒà ¢6–æ6ÇVFR&FVfVÇEö6öæf–ræ‡  ¢6–æ6ÇVFRÇv–æF÷w2æƒà ¢6–æ6ÇVFRÆÆv÷&—F†Óà¢6–æ6ÇVFRÆ'&“à¢6–æ6ÇVFRÆFöÖ–3à¢6–æ6ÇVFRÆ6†&6öçcà¢6–æ6ÇVFRÆ6ÖFƒà¢6–æ6ÇVFRÆ77FF–çCà¢6–æ6ÇVFRÆ77FF–óà¢6–æ6ÇVFRÆf–ÆW7—7FVÓà¢6–æ6ÇVFRÆg7G&VÓà¢6–æ6ÇVFRÆ—FW&F÷#à¢6–æ6ÇVFRÆÆ–Ö—G3à¢6–æ6ÇVFRÆ×WFWƒà¢6–æ6ÇVFRÆ÷F–öæÃà¢6–æ6ÇVFRÇ&æFöÓà¢6–æ6ÇVFRÇ7G&–æsà¢6–æ6ÇVFRÇ7G&–æu÷f–Wsà¢6–æ6ÇVFRÇ7—7FVÕöW'&÷#à¢6–æ6ÇVFRÇVæ÷&FW&VEöÖà¢6–æ6ÇVFRÇVæ÷&FW&VE÷6WCà¢6–æ6ÇVFRÇfV7F÷#à ¢6–æ6ÇVFRÇFöÖÂ²²÷FöÖÂæ‡à ¦æÖW76R° ¦6öç7FW‡"6†"ÇVv–ä–EµÒÒ'VÇF–ÖFR×67&W"#°¦6öç7FW‡"6†"6öçfW'EF&vWEµÒÒ$†÷&G&–47V&UæVÄÖW76vR#°¦6öç7FW‡"6†"7F6„6öçfW'EF&vWEµÒÒ$&æµæVÄÖW76vR#°¦6öç7FW‡"6†"6öçfW'D6öÖÖæEµÒÒ$6öçfW'B#°¦6öç7FW‡"6†"67&W$'WGFöäÖ&¶W%µÒÒ%VÇF–ÖFU67&W"#°¦6öç7FW‡"6†"&F6…FövvÆTÖ&¶W%µÒÒ%VÇF–ÖFU67&W$&F6‚#°¦6öç7FW‡"7FC£§6—¦U÷BÖ†–×VÔ7V&T—FV×2Ò#°¦6öç7FW‡"7FC£§6—¦U÷BÖ†–×VÔ–çWDÆ—7G2ÒcC°¦6öç7FW‡"7FC£§6—¦U÷BÖ†–×VÔ—FVÕG—U&÷w2Ò#Cƒ°¦6öç7FW‡"7FC£§6—¦U÷BÖ†–×VÔ—FVÕ&÷w2Òc3ƒC°¦6öç7FW‡"7FC£§6—¦U÷BÖ†–×VÔ7W7FöÕööÄVçG&–W2ÒcC°¦6öç7FW‡"7FC£§6—¦U÷BÖ†–×VÔ—FVÕVÆ—F–W2Òƒ°¦6öç7FW‡"7FC£§V–çC3%÷B'VæT6÷VçBÒ33°¦6öç7FW‡"7FC£§6—¦U÷BvVÕ6—¦T6÷VçBÒS°¦6öç7FW‡"7FC£§6—¦U÷BvV×5W%6—¦RÒs°¦6öç7FW‡"7FC£§6—¦U÷BÖ†–×VÕ6VÆV7F÷$6öFW2ÒvVÕ6—¦T6÷VçB¢vV×5W%6—¦S°¦6öç7FW‡"7FC£§6—¦U÷BÖ†–×VÔ7W7FöÔ÷WGWD6öFTÆVæwF‚Ò3#°¦6öç7FW‡"7FC£§V–çC3%÷BÖ†–×VÕ'VæT÷WGWG2Ò3°¦6öç7FW‡"7FC£§V–çC3%÷BÖ†–×VÔ7W7FöÕ&æFöÔ÷WGWG2Ò#°¦6öç7FW‡"7FC£§6—¦U÷BÖ†–×VÔ7W7FöÔ÷WGWG2ÒC%$Ã£¤—FV×3£¤Ö…G&ç67F–öä÷WGWG3°¦6öç7FW‡"7FC£§V–çC3%÷B'VæU&&—G•7FWW&6VçBÒƒ°¦6öç7FW‡"v6†%÷B6öæf–tf–ÆTæÖUµÒÒÂ'VÇF–ÖFR×67&W"çFöÖÂ#°¦6öç7FW‡"7FC£¦'&“Ç7FC£§7G&–æu÷f–WrÂ'VæT6÷VçCâ'VæTæÖW7°¢&VÂ"Â&VÆB"Â'F—""Â&æVb"Â&WF‚"Â&—F‚"Â'FÂ"Â'&Â"Â&÷'B"À¢'F‡VÂ"Â&Öâ"Â'6öÂ"Â'6†VÂ"Â&FöÂ"Â&†VÂ"Â&–ò"Â&ÇVÒ"Â&¶ò"À¢&fÂ"Â&ÆVÒ"Â'VÂ"Â'VÒ"Â&ÖÂ"Â&—7B"Â&wVÂ"Â'fW‚"Â&ö†Ò"À¢&Æò"Â'7W""Â&&W""Â&¦‚"Â&6†Ò"Â'¦öB"À§Ó°¦6öç7FW‡"7FC£¦'&“Ç7FC£§7G&–æu÷f–WrÂvVÕ6—¦T6÷VçCâvVÕ6—¦TæÖW7°¢&6†—VB"Â&fÆvVB"Â&æ÷&ÖÂ"Â&fÆvÆW72"Â'W&fV7B"À§Ó°¦6öç7FW‡"7FC£¦'&“Ç7FC£¦'&“Ç7FC£§7G&–æu÷f–WrÂvV×5W%6—¦SâÂvVÕ6—¦T6÷VçCà¢vVÔ6öFW7·°¢²&v7b"Â&v7’"Â&v6""Â&v6r"Â&v7""Â&v7r"Â'6¶2'ÒÀ¢²&vgb"Â&vg’"Â&vf""Â&vfr"Â&vg""Â&vgr"Â'6¶b'ÒÀ¢²&w7b"Â&w7’"Â&w6""Â&w6r"Â&w7""Â&w7r"Â'6·R'ÒÀ¢²&w§b"Â&vÇ’"Â&vÆ""Â&vÆr"Â&vÇ""Â&vÇr"Â'6¶Â'ÒÀ¢²&wb"Â&w’"Â&w""Â&wr"Â&w""Â&wr"Â'6·¢'ÒÀ¢×Ó° ¦WFòÖ¶TFVfVÇE'VæUvV–v‡G2‚’Óâ7FC£¦'&“ÆF÷V&ÆRÂ'VæT6÷VçCâ°¢7FC£¦'&“ÆF÷V&ÆRÂ'VæT6÷VçCâvV–v‡G7·Ó°¢F÷V&ÆRvV–v‡BÒã°¢f÷"†F÷V&ÆRb'VæUvV–v‡B¢vV–v‡G2’°¢'VæUvV–v‡BÒvV–v‡C°¢vV–v‡B£Ò7FF–5ö67CÆF÷V&ÆSâ…'VæU&&—G•7FWW&6VçB’òã°¢Ğ¢&WGW&âvV–v‡G3°§Ğ §7G'V7B'VæU6WGF–æw2°¢7FC£§V–çC3%÷Bf–ÇW&T6†æ6UW&6VçG³3Ó°¢7FC£¦'&“Ç7FC£§V–çC3%÷BÂÖ†–×VÕ'VæT÷WGWG3â÷WGWD6÷VçEvV–v‡G7³sÂ#RÂWÓ°¢7FC£¦'&“ÆF÷V&ÆRÂ'VæT6÷VçCâ'VæUvV–v‡G2ÒÖ¶TFVfVÇE'VæUvV–v‡G2‚“°¢F÷V&ÆRF÷FÅ'VæUvV–v‡G·Ó°§Ó° ¦VçVÒ6Æ72÷WGWDÖöFR°¢'VæW2À¢7W7FöÒÀ¢&÷F‚À§Ó° ¦VçVÒ6Æ72G&ç6×WFT'WGFöäÖöFR°¢æF—fRÀ¢6W&FRÀ§Ó° §7G'V7B7W7FöÔ÷WGWDVçG'’°¢7FC£§V–çC3%÷B6öFW·Ó°¢7FC£¦'&“Ç7FC£§V–çC3%÷BÂÖ†–×VÕ6VÆV7F÷$6öFW3â6VÆV7F÷$6öFW7·Ó°¢7FC£§6—¦U÷B6VÆV7F÷$6öFT6÷VçG·Ó°¢7FC£¦'&“ÄC%$Ã£¤—FV×3£¥VÆ—G’ÂÖ†–×VÔ—FVÕVÆ—F–W3âVÆ—F–W7·Ó°¢7FC£§6—¦U÷BVÆ—G”6÷VçG·Ó°¢7FC£§V–çC3%÷BVçF—G—´C%$Ã£¤—FV×3£¤FVfVÇEfÇVWÓ°¢F÷V&ÆRvV–v‡G³ãÓ°¢&ööÂwV&çFVVG·Ó°¢&ööÂ&æFöÕVÆ—G—·Ó°§Ó° §7G'V7B7W7FöÕ6WGF–æw2°¢7FC£§V–çC3%÷Bf–ÇW&T6†æ6UW&6VçG³3Ó°¢7FC£¦'&“Ç7FC£§V–çC3%÷BÂÖ†–×VÔ7W7FöÕ&æFöÔ÷WGWG3â÷WGWD6÷VçEvV–v‡G7³Ó°¢7FC£§V–çC3%÷B—FVÔÆWfVÇ³Ó°¢7FC£¦'&“Ä7W7FöÔ÷WGWDVçG'’ÂÖ†–×VÔ7W7FöÕööÄVçG&–W3â—FV×7·Ó°¢7FC£§6—¦U÷B—FVÔ6÷VçG·Ó°¢7FC£§6—¦U÷BwV&çFVVD6÷VçG·Ó°¢F÷V&ÆRF÷FÅvV–v‡G·Ó°§Ó° §7G'V7B–çWE'VÆR°¢7FC£§V–çC3%÷B6öFW·Ó°¢7FC£§V–çC3%÷B—FVÕG—T6öFW·Ó°¢C%$Ã£¤—FV×3£¥VÆ—G’VÆ—G—´C%$Ã£¤—FV×3£¥VÆ—G“£¥Væ¶æ÷vçÓ°¢&ööÂç”6öFW·Ó°¢&ööÂÖF6†W4—FVÕG—W·Ó°¢&ööÂ†5VÆ—G—·Ó°§Ó° §7G'V7B–çWE'VÆTÆ—7B°¢7FC£¦'&“Ä–çWE'VÆRÂÖ†–×VÔ7V&T—FV×3â—FV×7·Ó°¢7FC£§6—¦U÷B—FVÔ6÷VçG·Ó°§Ó° §7G'V7B–çWE6WGF–æw2°¢7FC£¦'&“Ä–çWE'VÆTÆ—7BÂÖ†–×VÔ–çWDÆ—7G3âÆ—7G7·Ó°¢7FC£§6—¦U÷BÆ—7D6÷VçG·Ó°¢&ööÂW6–ætFVfVÇE'VÆW7·G'VWÓ°¢&ööÂfÆ–G·G'VWÓ°§Ó° §7G'V7B—FVÕG—T6FÆör°¢7FC£§Væ÷&FW&VE÷6WCÇ7FC£§V–çC3%÷Câ¶æ÷våG—T6öFW3°¢7FC£§Væ÷&FW&VEöÖÇ7FC£§V–çC3%÷BÂ7FC£¦'&“Ç7FC£§V–çC3%÷BÂ#ãâ&VçEG—W3°¢7G'V7BVÆ—G”fÆw2°¢&ööÂÖv–7·Ó°¢&ööÂ&&W·Ó°¢&ööÂæ÷&ÖÇ·Ó°¢Ó°¢7FC£§Væ÷&FW&VEöÖÇ7FC£§V–çC3%÷BÂVÆ—G”fÆw3âVÆ—G”fÆw4'•G—S°¢7FC£§Væ÷&FW&VEöÖÇ7FC£§V–çC3%÷BÂ7FC£§fV7F÷#Ç7FC£§V–çC3%÷CãâF—&V7D—FVÕG—W4'”—FVÔ6öFS°¢7FC£§Væ÷&FW&VEöÖÇ7FC£§V–çC3%÷BÂ7FC£§fV7F÷#Ç7FC£§V–çC3%÷Cãâ—FVÕG—W4'”—FVÔ6öFS°¢7FC£§Væ÷&FW&VE÷6WCÇ7FC£§V–çC3%÷CâVW7D—FVÔ6öFW3°¢7FC£§Væ÷&FW&VE÷6WCÇ7FC£§V–çC3%÷CâWV—ÖVçD—FVÔ6öFW3°¢7FC£§Væ÷&FW&VEöÖÇ7FC£§V–çC3%÷BÂ7FC£§V–çC3%÷Câ—FVÔfÖ–Ç”'”—FVÔ6öFS°¢7FC£§Væ÷&FW&VE÷6WCÇ7FC£§V–çC3%÷CâVæ—VT—FVÔ6öFW3°¢7FC£§Væ÷&FW&VE÷6WCÇ7FC£§V–çC3%÷Câ6WD—FVÔ6öFW3°¢7FC£§Væ÷&FW&VE÷6WCÇ7FC£§V–çC3%÷Câ7&gFVD—FVÔ6öFW3°¢7FC£§Væ÷&FW&VE÷6WCÇ7FC£§V–çC3%÷Câ7&gFVD—FVÕG—T6öFW3°¢7FC£§Væ÷&FW&VE÷6WCÇ7FC£§V–çC3%÷Câ7&gFVD—FVÔfÖ–Æ–W3°¢7FC£§Væ÷&FW&VEöÖÇ7FC£§V–çC3%÷BÂ7FC£§fV7F÷#ÄC%$Ã£¤—FV×3£¥VÆ—G“ãâfÆ–EVÆ—F–W4'”—FVÔ6öFS°¢&ööÂf–Æ&ÆW·Ó°§Ó° §7G'V7B6WGF–æw2°¢÷WGWDÖöFR7F—fT÷WGWDÖöFW´÷WGWDÖöFS£¥'VæW7Ó°¢G&ç6×WFT'WGFöäÖöFRG&ç6×WFT'WGFöäÖöFWµG&ç6×WFT'WGFöäÖöFS£¥6W&FWÓ°¢&ööÂ6†÷t&F6„6†V6¶&÷†W7·G'VWÓ°¢&ööÂ&F6…67&Çv—4öç·Ó°¢–çWE6WGF–æw2–çWC°¢'VæU6WGF–æw2'VæW3°¢7W7FöÕ6WGF–æw27W7FöÓ°§Ó° §7G'V7BVæF–ætW†6†ævR°¢C%$Ã£¥Æ–W$†æFÆRÆ–W'´C%$Ã£¤–çfÆ–EÆ–W$†æFÆWÓ°¢7FC£¦'&“ÄC%$Ã£¤—FV×3£¤—FVÔ–æfòÂÖ†–×VÔ7V&T—FV×3â—FV×7·Ó°¢7FC£§6—¦U÷B—FVÔ6÷VçG·Ó°¢&ööÂ&F6„ÖöFU&WVW7FVG·Ó°¢&ööÂ&ö6W74–æF—f–GVÆÇ—·Ó°§Ó° §7G'V7B7V&T6öÆÆV7F÷"°¢7FC£¦'&“ÄC%$Ã£¤—FV×3£¤—FVÔ–æfòÂÖ†–×VÔ7V&T—FV×3â—FV×7·Ó°¢7FC£§6—¦U÷B6÷VçG·Ó°¢&ööÂ÷fW&fÆ÷w·Ó°§Ó° ¥6WGF–æw26öæf–s°¤—FVÕG—T6FÆör—FVÕG—TFF°¦&ööÂG—U'VÆU&WVW7FVG·Ó°§7FC£¦FöÖ–5ö&ööÂ&F6„ÖöFTVæ&ÆVG·Ó° ¦6öç7FW‡"C%$Ã£¥ÇVv–ä–æfò–æf÷°¢æ–æfõ6—¦RÒC%$Ã£¥ÇVv–ä–æfõ6—¦RÀ¢æ&•fW'6–öâÒC%$ÅõÅTt”åô$•õdU%4”ôâÀ¢æ–BÒÇVv–ä–BÀ¢ææÖRÒ%VÇF–ÖFR67&W""À¢çfW'6–öâÒ#ã"ãB"À¢æWF†÷"Ò$ÖDÖ–¶R"À¢æFW67&—F–öâÒ%G&ç6×WFW26öæf–wW&VB–çWB—FV×2–çFò'VæW2÷"6öæf–wW&&ÆR7W7FöÒ—FV×2â"À¢æfÆw2ÒC%$Ã£¥ÇVv–äfÆw3£¤6Æ–VçBÀ§Ó° ¦6öç7BC%$Ã£¥ÇVv–ä6öçFW‡B¢6öçFW‡G·Ó°¦6öç7BC%$Ã£¤–çfVçF÷'•6W'f–6R¢–çfVçF÷'•6W'f–6W·Ó°¦6öç7BC%$Ã£¤—FVÕ6W'f–6R¢—FVÕ6W'f–6W·Ó°¦6öç7BC%$Ã£¥F‡&VE6W'f–6R¢F‡&VE6W'f–6W·Ó°¦6öç7BC%$Ã£¥6†&VDWfVçE6W'f–6R¢WfVçE6W'f–6W·Ó°¤C%$Ã£¥6†&VDWfVçG3£¤Æ—7FVæW$†æFÆRÖW76vT†æFÆW´C%$Ã£¥6†&VDWfVçG3£¤–çfÆ–D†æFÆWÓ°§7FC£¦FöÖ–3Æ&ööÃâ7F—fW·Ó°§7FC£¦FöÖ–3Æ&ööÃâW†6†ævUVæF–æw·Ó°§7FC£¦FöÖ–3Æ&ööÃâ6öçfW'DÖW76vTÆövvVG·Ó°§7FC£¦FöÖ–3Æ&ööÃâ67&W$'WGFöäÖW76vTÆövvVG·Ó°§7FC£¦FöÖ–3Æ&ööÃâÖ—6ÖF6„ÖW76vTÆövvVG·Ó°§7FC£¦×WFW‚VæF–æt×WFWƒ°¥VæF–ætW†6†ævRVæF–æs°§7FC£¦×C““3r&æFöÔVæv–æS° ¦WFòõö6FV6Â6öÆÆV7D7V&T—FVÒ†6öç7BC%$Ã£¥ÇVv–ä6öçFW‡B¢Â6öç7BC%$Ã£¤—FV×3£¤—FVÔ–æfò¢—FVÒÀ¢fö–B¢W6W$FF’æöW†6WBÓâC%$Ã£¤–çfVçF÷'“£¤—FW&F–öä7F–öâ°¢WFò¢6öÆÆV7F÷"Ò7FF–5ö67CÄ7V&T6öÆÆV7F÷"£â‡W6W$FF“°¢–b†6öÆÆV7F÷"ÓÒçVÆÇG"ÇÂ—FVÒÓÒçVÆÇG ¢ÇÂ—FVÒÓç7G'V7E6—¦RÂC%$Ã£¤—FV×3£¤—FVÔ–æfõ&WV—&VE6—¦R’°¢&WGW&âC%$Ã£¤–çfVçF÷'“£¤—FW&F–öä7F–öã£¤6öçF–çVS°¢Ğ¢–b†6öÆÆV7F÷"Óæ6÷VçBãÒ6öÆÆV7F÷"Óæ—FV×2ç6—¦R‚’’°¢6öÆÆV7F÷"Óæ÷fW&fÆ÷rÒG'VS°¢&WGW&âC%$Ã£¤–çfVçF÷'“£¤—FW&F–öä7F–öã£¥7F÷°¢Ğ¢6öÆÆV7F÷"Óæ—FV×5¶6öÆÆV7F÷"Óæ6÷VçB²µÒÒ¦—FVÓ°¢&WGW&âC%$Ã£¤–çfVçF÷'“£¤—FW&F–öä7F–öã£¤6öçF–çVS°§Ğ ¦WFò&VD7V&T—FV×2„C%$Ã£¥Æ–W$†æFÆRÆ–W"Â7V&T6öÆÆV7F÷"b7V&R’æöW†6W@¢ÓâC%$Ã£¤–çfVçF÷'“£¥&W7VÇB°¢6öç7BC%$Ã£¤–çfVçF÷'“£¤—FVÔf–ÇFW"f–ÇFW'°¢ç7G'V7E6—¦RÒC%$Ã£¤–çfVçF÷'“£¤—FVÔf–ÇFW%6—¦RÀ¢æfÆw2ÒÀ¢æ6öçF–æW$Ö6²ÒC%$Ã£¤—FV×3£¤6öçF–æW$&—B„C%$Ã£¤—FV×3£¤—FVÔ6öçF–æW#£¤7V&R’À¢ç&W6W'fVBÒÀ¢Ó°¢&WGW&â–çfVçF÷'•6W'f–6RÓæf÷$V6„–çfVçF÷'”—FVÒ„6öçFW‡BÂÆ–W"Âff–ÇFW"À¢6öÆÆV7D7V&T—FVÒÂf7V&R“°§Ğ ¦6öç7FW‡"WFò6´—FVÕG—T6öFR„C%$Ã£¤–çfVçF÷'“£¤—FVÕG—Tf÷W$426öFR’æöW†6WBÓâ7FC£§V–çC3%÷B°¢7FC£§V–çC3%÷B6¶VG·Ó°¢f÷"‡7FC£§6—¦U÷B–æFW‚Ò²–æFW‚ÂC²²¶–æFW‚’°¢6¶VBÃÒ7FF–5ö67CÇ7FC£§V–çC3%÷Câ€¢7FF–5ö67CÇVç6–væVB6†#â†6öFRçfÇVU¶–æFW…Ò’’ÃÂ†–æFW‚¢…R“°¢Ğ¢&WGW&â6¶VC°§Ğ ¦WFò—FVÔ†5G—R‡7FC£§V–çC3%÷B—FVÔ6öFRÂ7FC£§V–çC3%÷BG—T6öFR’æöW†6WBÓâ&ööÂ°¢6öç7BWFò—FVÒÒ—FVÕG—TFFæ—FVÕG—W4'”—FVÔ6öFRæf–æB†—FVÔ6öFR“°¢&WGW&â—FVÒÒ—FVÕG—TFFæ—FVÕG—W4'”—FVÔ6öFRæVæB‚¢bb7FC£¦f–æB†—FVÒÓç6V6öæBæ&Vv–â‚’Â—FVÒÓç6V6öæBæVæB‚’ÂG—T6öFR’Ò—FVÒÓç6V6öæBæVæB‚“°§Ğ ¦6öç7FW‡"7FC£§V–çC3%÷BVW7D—FVÕG—T6öFRÒ6´—FVÕG—T6öFR€¢C%$Ã£¤–çfVçF÷'“£¤Ö¶T—FVÕG—Tf÷W$42‚'VW2"’“° ¦WFò—567&&ÆT–çWD—FVÒ†6öç7BC%$Ã£¤—FV×3£¤—FVÔ–æfòb—FVÒ’æöW†6WBÓâ&ööÂ°¢&WGW&â—FVÕG—TFFæf–Æ&ÆP¢bb—FVÕG—TFFæ¶æ÷våG—T6öFW2æ6öçF–ç2…VW7D—FVÕG—T6öFR¢bb—FVÕG—TFFçVW7D—FVÔ6öFW2æ6öçF–ç2†—FVÒæ6öFR¢bb—FVÔ†5G—R†—FVÒæ6öFRÂVW7D—FVÕG—T6öFR“°§Ğ ¦WFò–çWE'VÆTÖF6†W2†6öç7B–çWE'VÆRb'VÆRÀ¢6öç7BC%$Ã£¤—FV×3£¤—FVÔ–æfòb—FVÒ’æöW†6WBÓâ&ööÂ°¢–b‚—567&&ÆT–çWD—FVÒ†—FVÒ’’&WGW&âfÇ6S°¢6öç7B&ööÂ6öFTÖF6†W2Ò'VÆRæç”6öFP¢ÇÂ‡'VÆRæÖF6†W4—FVÕG—P¢ò—FVÔ†5G—R†—FVÒæ6öFRÂ'VÆRæ—FVÕG—T6öFR¢¢—FVÒæ6öFRÓÒ'VÆRæ6öFR“°¢&WGW&â6öFTÖF6†W0¢bb‚'VÆRæ†5VÆ—G’ÇÂ—FVÒçVÆ—G’ÓÒ'VÆRçVÆ—G’“°§Ğ ¦WFòÖF6…&VÖ–æ–æt–çWE'VÆW2†6öç7B–çWE'VÆTÆ—7Bb–çWBÀ¢6öç7B7V&T6öÆÆV7F÷"b7V&RÂ7FC£§V–çCe÷B76–væVE'VÆW2À¢7FC£§V–çCe÷BW6VD—FV×2’æöW†6WBÓâ&ööÂ°¢6öç7B7FC£§V–çCe÷BÆÅ'VÆW2Ò7FF–5ö67CÇ7FC£§V–çCe÷Câ€¢ƒRÃÂ–çWBæ—FVÔ6÷VçB’ÒR“°¢–b†76–væVE'VÆW2ÓÒÆÅ'VÆW2’&WGW&âG'VS° ¢7FC£§6—¦U÷B6VÆV7FVE'VÆRÒ–çWBæ—FVÔ6÷VçC°¢7FC£§6—¦U÷B6VÆV7FVD6æF–FFT6÷VçBÒÖ†–×VÔ7V&T—FV×2²°¢f÷"‡7FC£§6—¦U÷B'VÆT–æFW‚Ò²'VÆT–æFW‚Â–çWBæ—FVÔ6÷VçC²²·'VÆT–æFW‚’°¢–b‚†76–væVE'VÆW2bƒRÃÂ'VÆT–æFW‚’’Ò’6öçF–çVS°¢7FC£§6—¦U÷B6æF–FFW7·Ó°¢f÷"‡7FC£§6—¦U÷B—FVÔ–æFW‚Ò²—FVÔ–æFW‚Â7V&Ræ6÷VçC²²¶—FVÔ–æFW‚’°¢–b‚‡W6VD—FV×2bƒRÃÂ—FVÔ–æFW‚’’ÓÒ ¢bb–çWE'VÆTÖF6†W2†–çWBæ—FV×5·'VÆT–æFW…ÒÂ7V&Ræ—FV×5¶—FVÔ–æFW…Ò’’°¢²¶6æF–FFW3°¢Ğ¢Ğ¢–b†6æF–FFW2Â6VÆV7FVD6æF–FFT6÷VçB’°¢6VÆV7FVE'VÆRÒ'VÆT–æFWƒ°¢6VÆV7FVD6æF–FFT6÷VçBÒ6æF–FFW3°¢Ğ¢Ğ¢–b‡6VÆV7FVE'VÆRÓÒ–çWBæ—FVÔ6÷VçBÇÂ6VÆV7FVD6æF–FFT6÷VçBÓÒ’&WGW&âfÇ6S° ¢f÷"‡7FC£§6—¦U÷B—FVÔ–æFW‚Ò²—FVÔ–æFW‚Â7V&Ræ6÷VçC²²¶—FVÔ–æFW‚’°¢–b‚‡W6VD—FV×2bƒRÃÂ—FVÔ–æFW‚’’Ò ¢ÇÂ–çWE'VÆTÖF6†W2†–çWBæ—FV×5·6VÆV7FVE'VÆUÒÂ7V&Ræ—FV×5¶—FVÔ–æFW…Ò’’°¢6öçF–çVS°¢Ğ¢–b„ÖF6…&VÖ–æ–æt–çWE'VÆW2†–çWBÂ7V&RÀ¢7FF–5ö67CÇ7FC£§V–çCe÷Câ†76–væVE'VÆW2ÂƒRÃÂ6VÆV7FVE'VÆR’’À¢7FF–5ö67CÇ7FC£§V–çCe÷Câ‡W6VD—FV×2ÂƒRÃÂ—FVÔ–æFW‚’’’’°¢&WGW&âG'VS°¢Ğ¢Ğ¢&WGW&âfÇ6S°§Ğ ¦WFòÖF6†W46öæf–wW&VD–çWD—FVÒ†6öç7BC%$Ã£¤—FV×3£¤—FVÔ–æfòb—FVÒ’æöW†6W@¢Óâ&ööÂ°¢–b‚6öæf–ræ–çWBçfÆ–BÇÂ—567&&ÆT–çWD—FVÒ†—FVÒ’’&WGW&âfÇ6S°¢–b„6öæf–ræ–çWBçW6–ætFVfVÇE'VÆW2’°¢&WGW&â—FVÒçVÆ—G’ÓÒC%$Ã£¤—FV×3£¥VÆ—G“£¥Væ—VP¢ÇÂ—FVÒçVÆ—G’ÓÒC%$Ã£¤—FV×3£¥VÆ—G“£¥6WC°¢Ğ ¢7V&T6öÆÆV7F÷"6–ævÆT—FVÔ7V&S°¢6–ævÆT—FVÔ7V&Ræ—FV×5³ÒÒ—FVÓ°¢6–ævÆT—FVÔ7V&Ræ6÷VçBÒ°¢f÷"‡7FC£§6—¦U÷BÆ—7D–æFW‚Ò²Æ—7D–æFW‚Â6öæf–ræ–çWBæÆ—7D6÷VçC°¢²¶Æ—7D–æFW‚’°¢6öç7B–çWE'VÆTÆ—7Bb–çWBÒ6öæf–ræ–çWBæÆ—7G5¶Æ—7D–æFW…Ó°¢–b†–çWBæ—FVÔ6÷VçBÓÒ¢bbÖF6…&VÖ–æ–æt–çWE'VÆW2†–çWBÂ6–ævÆT—FVÔ7V&RÂÂ’’°¢&WGW&âG'VS°¢Ğ¢Ğ¢&WGW&âfÇ6S°§Ğ ¦WFòÖF6†W4&F6„–çWG2†6öç7B7V&T6öÆÆV7F÷"b7V&R’æöW†6WBÓâ&ööÂ°¢–b†7V&Ræ6÷VçBÓÒÇÂ7V&Ræ6÷VçBâÖ†–×VÔ7V&T—FV×2ÇÂ7V&Ræ÷fW&fÆ÷r’°¢&WGW&âfÇ6S°¢Ğ¢f÷"‡7FC£§6—¦U÷B–æFW‚Ò²–æFW‚Â7V&Ræ6÷VçC²²¶–æFW‚’°¢–b‚ÖF6†W46öæf–wW&VD–çWD—FVÒ†7V&Ræ—FV×5¶–æFW…Ò’’&WGW&âfÇ6S°¢Ğ¢&WGW&âG'VS°§Ğ ¦WFòÖF6†W46öæf–wW&VD–çWG2†6öç7B7V&T6öÆÆV7F÷"b7V&RÀ¢&ööÂ&F6„ÖöFU&WVW7FVBÂ&ööÂb&ö6W74–æF—f–GVÆÇ’’æöW†6WBÓâ&ööÂ°¢&ö6W74–æF—f–GVÆÇ’ÒfÇ6S°¢–b‚6öæf–ræ–çWBçfÆ–BÇÂ7V&Ræ÷fW&fÆ÷r’&WGW&âfÇ6S°¢–b†&F6„ÖöFU&WVW7FVBbbÖF6†W4&F6„–çWG2†7V&R’’°¢&ö6W74–æF—f–GVÆÇ’ÒG'VS°¢&WGW&âG'VS°¢Ğ¢–b„6öæf–ræ–çWBçW6–ætFVfVÇE'VÆW2’°¢&WGW&â7V&Ræ6÷VçBÓÒbbÖF6†W46öæf–wW&VD–çWD—FVÒ†7V&Ræ—FV×5³Ò“°¢Ğ¢–b†7V&Ræ6÷VçBâÖ†–×VÔ7V&T—FV×2’°¢&WGW&âfÇ6S°¢Ğ¢f÷"‡7FC£§6—¦U÷BÆ—7D–æFW‚Ò²Æ—7D–æFW‚Â6öæf–ræ–çWBæÆ—7D6÷VçC²²¶Æ—7D–æFW‚’°¢6öç7B–çWE'VÆTÆ—7Bb–çWBÒ6öæf–ræ–çWBæÆ—7G5¶Æ—7D–æFW…Ó°¢–b†7V&Ræ6÷VçBÓÒ–çWBæ—FVÔ6÷Vç@¢bbÖF6…&VÖ–æ–æt–çWE'VÆW2†–çWBÂ7V&RÂÂ’’°¢&WGW&âG'VS°¢Ğ¢Ğ¢&WGW&âfÇ6S°§Ğ ¦WFòÖF6†W5VæF–ær†6öç7B7V&T6öÆÆV7F÷"b7V&RÀ¢6öç7BVæF–ætW†6†ævRbVæF–ær’æöW†6WBÓâ&ööÂ°¢&ööÂ&ö6W74–æF—f–GVÆÇ—·Ó°¢–b‚ÖF6†W46öæf–wW&VD–çWG2†7V&RÂVæF–æræ&F6„ÖöFU&WVW7FVBÀ¢&ö6W74–æF—f–GVÆÇ’¢ÇÂ&ö6W74–æF—f–GVÆÇ’ÒVæF–ærç&ö6W74–æF—f–GVÆÇ¢ÇÂ7V&Ræ6÷VçBÒVæF–æræ—FVÔ6÷VçB’&WGW&âfÇ6S°¢7FC£§V–çCe÷BÖF6†VD—FV×7·Ó°¢f÷"‡7FC£§6—¦U÷BVæF–æt–æFW‚Ò²VæF–æt–æFW‚ÂVæF–æræ—FVÔ6÷VçC²²·VæF–æt–æFW‚’°¢6öç7BWFòbW‡V7FVBÒVæF–æræ—FV×5·VæF–æt–æFW…Ó°¢&ööÂf÷VæG·Ó°¢f÷"‡7FC£§6—¦U÷B—FVÔ–æFW‚Ò²—FVÔ–æFW‚Â7V&Ræ6÷VçC²²¶—FVÔ–æFW‚’°¢6öç7BWFòb7GVÂÒ7V&Ræ—FV×5¶—FVÔ–æFW…Ó°¢–b‚†ÖF6†VD—FV×2bƒRÃÂ—FVÔ–æFW‚’’ÓÒ ¢bb7GVÂæ6öFRÓÒW‡V7FVBæ6öFP¢bb7GVÂçVÆ—G’ÓÒW‡V7FVBçVÆ—G¢bb7GVÂçVÆ—G•&V6÷&D–BÓÒW‡V7FVBçVÆ—G•&V6÷&D–B’°¢f÷VæBÒG'VS°¢ÖF6†VD—FV×2Ò7FF–5ö67CÇ7FC£§V–çCe÷Câ†ÖF6†VD—FV×2ÂƒRÃÂ—FVÔ–æFW‚’“°¢'&V³°¢Ğ¢Ğ¢–b‚f÷VæB’&WGW&âfÇ6S°¢Ğ¢&WGW&âG'VS°§Ğ ¦6öç7FW‡"WFòÖ¶U'VæT6öFR‡7FC£§V–çC3%÷B'VæTçVÖ&W"’æöW†6WBÓâ7FC£§V–çC3%÷B°¢&WGW&âC%$Ã£¤—FV×3£¤Ö¶T—FVÔ6öFR‚w"rÀ¢7FF–5ö67CÆ6†#â‚sr²'VæTçVÖ&W"òR’À¢7FF–5ö67CÆ6†#â‚sr²'VæTçVÖ&W"RR’“°§Ğ ¦WFò÷WGWD–FVçF–f–VE7FFTfÆw2‡7FC£§V–çC3%÷B—FVÔ6öFR’æöW†6W@¢Óâ7FC£§V–çC3%÷B°¢&ööÂ—4æF—fU'VæW·Ó°¢f÷"‡7FC£§V–çC3%÷B'VæTçVÖ&W"Ò²'VæTçVÖ&W"ÃÒ'VæT6÷VçC²²·'VæTçVÖ&W"’°¢–b†—FVÔ6öFRÓÒÖ¶U'VæT6öFR‡'VæTçVÖ&W"’’°¢—4æF—fU'VæRÒG'VS°¢'&V³°¢Ğ¢Ğ¢–b†—4æF—fU'VæP¢ÇÂ—FVÔ†5G—R†—FVÔ6öFRÂC%$Ã£¤—FV×3£¤Ö¶T—FVÔ6öFR‚''VæR"’¢ÇÂ—FVÔ†5G—R†—FVÔ6öFRÂC%$Ã£¤—FV×3£¤Ö¶T—FVÔ6öFR‚&vVÒ"’’’°¢&WGW&âC%$Ã£¤—FV×3£¤—FVÕ7FFT–FVçF–f–VC°¢Ğ¢–b‚—FVÔ†5G—R†—FVÔ6öFRÂC%$Ã£¤—FV×3£¤Ö¶T—FVÔ6öFR‚&Ö—62"’’’°¢&WGW&â°¢Ğ ¢6öç7FW‡"7FC£¦'&“Ç7FC£§V–çC3%÷BÂcâW†6ÇVFVDÖ—65G—W7°¢C%$Ã£¤—FV×3£¤Ö¶T—FVÔ6öFR‚&×VÂ"’À¢C%$Ã£¤—FV×3£¤Ö¶T—FVÔ6öFR‚'&–ær"’À¢C%$Ã£¤—FV×3£¤Ö¶T—FVÔ6öFR‚&&÷w"’À¢C%$Ã£¤—FV×3£¤Ö¶T—FVÔ6öFR‚'†&÷"’À¢C%$Ã£¤—FV×3£¤Ö¶T—FVÔ6öFR‚&6†""’À¢C%$Ã£¤—FV×3£¤Ö¶T—FVÔ6öFR‚'F÷&2"’À¢Ó°¢6öç7B&ööÂW†6ÇVFVBÒ7FC£¦ç•ööb†W†6ÇVFVDÖ—65G—W2æ&Vv–â‚’À¢W†6ÇVFVDÖ—65G—W2æVæB‚’Â¶—FVÔ6öFUÒ‡7FC£§V–çC3%÷BG—T6öFR’æöW†6WB°¢&WGW&â—FVÔ†5G—R†—FVÔ6öFRÂG—T6öFR“°¢Ò“°¢&WGW&âW†6ÇVFVBò¢C%$Ã£¤—FV×3£¤—FVÕ7FFT–FVçF–f–VC°§Ğ §FV×ÆFRÇG—VæÖRvV–v‡DCà¦WFò6†ö÷6UvV–v‡FVD–æFW‚‡7FC£§6—¦U÷B6÷VçBÂF÷V&ÆRF÷FÅvV–v‡BÀ¢vV–v‡DBvV–v‡DB’æöW†6WBÓâ7FC£§6—¦U÷B°¢6öç7BF÷V&ÆR&öÆÂÒ7FC£§Væ–f÷&Õ÷&VÅöF—7G&–'WF–öãÆF÷V&ÆSâƒãÂF÷FÅvV–v‡B’…&æFöÔVæv–æR“°¢F÷V&ÆR7V×VÆF—fW·Ó°¢7FC£§6—¦U÷BÆ7E÷6—F—fW·Ó°¢f÷"‡7FC£§6—¦U÷B–æFW‚Ò²–æFW‚Â6÷VçC²²¶–æFW‚’°¢6öç7BF÷V&ÆRvV–v‡BÒvV–v‡DB†–æFW‚“°¢–b‡vV–v‡BÃÒã’6öçF–çVS°¢Æ7E÷6—F—fRÒ–æFWƒ°¢7V×VÆF—fR³ÒvV–v‡C°¢–b‡&öÆÂÂ7V×VÆF—fR’&WGW&â–æFWƒ°¢Ğ¢&WGW&âÆ7E÷6—F—fS°§Ğ ¦WFò6†ö÷6U'VæT–æFW‚‚’æöW†6WBÓâ7FC£§6—¦U÷B°¢&WGW&â6†ö÷6UvV–v‡FVD–æFW‚„6öæf–rç'VæW2ç'VæUvV–v‡G2ç6—¦R‚’À¢6öæf–rç'VæW2çF÷FÅ'VæUvV–v‡BÂµÒ‡7FC£§6—¦U÷B–æFW‚’æöW†6WB°¢&WGW&â6öæf–rç'VæW2ç'VæUvV–v‡G5¶–æFW…Ó°¢Ò“°§Ğ ¦WFò6†ö÷6T7W7FöÔ—FVÔ–æFW‚‚’æöW†6WBÓâ7FC£§6—¦U÷B°¢&WGW&â6†ö÷6UvV–v‡FVD–æFW‚„6öæf–ræ7W7FöÒæ—FVÔ6÷VçBÀ¢6öæf–ræ7W7FöÒçF÷FÅvV–v‡BÂµÒ‡7FC£§6—¦U÷B–æFW‚’æöW†6WB°¢6öç7B7W7FöÔ÷WGWDVçG'’bVçG'’Ò6öæf–ræ7W7FöÒæ—FV×5¶–æFW…Ó°¢&WGW&âVçG'’æwV&çFVVBòã¢VçG'’çvV–v‡C°¢Ò“°§Ğ ¦WFò6†ö÷6T7W7FöÔ÷WGWD6öFR†6öç7B7W7FöÔ÷WGWDVçG'’bVçG'’’æöW†6W@¢Óâ7FC£§V–çC3%÷B°¢–b†VçG'’ç6VÆV7F÷$6öFT6÷VçBÓÒ’&WGW&âVçG'’æ6öFS°¢6öç7B7FC£§6—¦U÷B–æFW‚Ò7FC£§Væ–f÷&Õö–çEöF—7G&–'WF–öãÇ7FC£§6—¦U÷Câ€¢ÂVçG'’ç6VÆV7F÷$6öFT6÷VçBÒ’…&æFöÔVæv–æR“°¢&WGW&âVçG'’ç6VÆV7F÷$6öFW5¶–æFW…Ó°§Ğ ¦WFò6†ö÷6U&æFöÕVÆ—G’‡7FC£§V–çC3%÷B—FVÔ6öFR’æöW†6W@¢ÓâC%$Ã£¤—FV×3£¥VÆ—G’°¢6öç7BWFòf÷VæBÒ—FVÕG—TFFçfÆ–EVÆ—F–W4'”—FVÔ6öFRæf–æB†—FVÔ6öFR“°¢–b†f÷VæBÓÒ—FVÕG—TFFçfÆ–EVÆ—F–W4'”—FVÔ6öFRæVæB‚¢ÇÂf÷VæBÓç6V6öæBæV×G’‚’’°¢&WGW&âC%$Ã£¤—FV×3£¥VÆ—G“£¤æ÷&ÖÃ°¢Ğ¢6öç7B7FC£§6—¦U÷B–æFW‚Ò7FC£§Væ–f÷&Õö–çEöF—7G&–'WF–öãÇ7FC£§6—¦U÷Câ€¢Âf÷VæBÓç6V6öæBç6—¦R‚’Ò’…&æFöÔVæv–æR“°¢&WGW&âf÷VæBÓç6V6öæE¶–æFW…Ó°§Ğ ¦WFò6†ö÷6T7W7FöÔ÷WGWEVÆ—G’†6öç7B7W7FöÔ÷WGWDVçG'’bVçG'’À¢7FC£§V–çC3%÷B—FVÔ6öFR’æöW†6W@¢ÓâC%$Ã£¤—FV×3£¥VÆ—G’°¢–b†VçG'’ç&æFöÕVÆ—G’’&WGW&â6†ö÷6U&æFöÕVÆ—G’†—FVÔ6öFR“°¢–b†VçG'’çVÆ—G”6÷VçBÓÒ’&WGW&âC%$Ã£¤—FV×3£¥VÆ—G“£¤æ÷&ÖÃ°¢6öç7B7FC£§6—¦U÷B–æFW‚Ò7FC£§Væ–f÷&Õö–çEöF—7G&–'WF–öãÇ7FC£§6—¦U÷Câ€¢ÂVçG'’çVÆ—G”6÷VçBÒ’…&æFöÔVæv–æR“°¢&WGW&âVçG'’çVÆ—F–W5¶–æFW…Ó°§Ğ ¦WFò6†ö÷6T÷WGWDÖöFR‚’æöW†6WBÓâ÷WGWDÖöFR°¢–b„6öæf–ræ7F—fT÷WGWDÖöFRÒ÷WGWDÖöFS£¤&÷F‚’°¢&WGW&â6öæf–ræ7F—fT÷WGWDÖöFS°¢Ğ¢&WGW&â7FC£§Væ–f÷&Õö–çEöF—7G&–'WF–öãÇ7FC£§V–çC3%÷CâƒÂ’…&æFöÔVæv–æR’ÓÒ ¢ò÷WGWDÖöFS£¥'VæW2¢÷WGWDÖöFS£¤7W7FöÓ°§Ğ ¦WFòÖ¶T÷WGWE7V2‡7FC£§V–çC3%÷B6öFRÂC%$Ã£¤—FV×3£¥VÆ—G’VÆ—G’À¢7FC£§V–çC3%÷B—FVÔÆWfVÂÂ7FC£§V–çC3%÷BVçF—G’’æöW†6W@¢ÓâC%$Ã£¤—FV×3£¤—FVÔ7&VFU7V2°¢C%$Ã£¤—FV×3£¤—FVÔ7&VFU7V2÷WGWG·Ó°¢÷WGWBç7G'V7E6—¦RÒC%$Ã£¤—FV×3£¤—FVÔ7&VFU7V56—¦S°¢÷WGWBæ6öFRÒ6öFS°¢÷WGWBçVÆ—G’ÒVÆ—G“°¢÷WGWBçVÆ—G•&V6÷&D–BÒC%$Ã£¤—FV×3£¥&æFöÕVÆ—G•&V6÷&C°¢÷WGWBæ—FVÔÆWfVÂÒ—FVÔÆWfVÃ°¢÷WGWBç6VVDÖöFRÒC%$Ã£¤—FV×3£¥6VVDÖöFS£¥&æFöÓ°¢÷WGWBçVçF—G’ÒVçF—G“°¢÷WGWBæGW&&–Æ—G’ÒC%$Ã£¤—FV×3£¤FVfVÇEfÇVS°¢÷WGWBç6ö6¶WD6÷VçBÒ°¢÷WGWBç7FFTfÆw2Ò÷WGWD–FVçF–f–VE7FFTfÆw2†6öFR“°¢÷WGWBæFW7F–æF–öâÒ°¢ç7G'V7E6—¦RÒC%$Ã£¤—FV×3£¤—FVÔFW7F–æF–öå6—¦RÀ¢æfÆw2ÒÀ¢æ6öçF–æW"ÒC%$Ã£¤—FV×3£¤—FVÔ6öçF–æW#£¤7V&RÀ¢çÆ6VÖVçBÒC%$Ã£¤—FV×3£¥Æ6VÖVçC£¤WFöÖF–2À¢æ7W7FöÕvT†æFÆRÒÀ¢ç‚ÒÀ¢ç’ÒÀ¢Ó°¢&WGW&â÷WGWC°§Ğ ¦WFòVæE'VæT÷WGWG2€¢7FC£¦'&“ÄC%$Ã£¤—FV×3£¤—FVÔ7&VFU7V2ÂÖ†–×VÔ7W7FöÔ÷WGWG3âb÷WGWG2À¢7FC£§6—¦U÷Bb÷WGWD6÷VçB’æöW†6WBÓâ&ööÂ°¢6öç7B7FC£§V–çC3%÷B6÷VçE&öÆÂĞ¢7FC£§Væ–f÷&Õö–çEöF—7G&–'WF–öãÇ7FC£§V–çC3%÷CâƒÂ’…&æFöÔVæv–æR“°¢7FC£§V–çC3%÷B7V×VÆF—fW·Ó°¢7FC£§V–çC3%÷B6÷VçG·Ó°¢f÷"‡7FC£§6—¦U÷B–æFW‚Ò°¢–æFW‚Â6öæf–rç'VæW2æ÷WGWD6÷VçEvV–v‡G2ç6—¦R‚“²²¶–æFW‚’°¢7V×VÆF—fR³Ò6öæf–rç'VæW2æ÷WGWD6÷VçEvV–v‡G5¶–æFW…Ó°¢–b†6÷VçE&öÆÂÃÒ7V×VÆF—fR’°¢6÷VçBÒ7FF–5ö67CÇ7FC£§V–çC3%÷Câ†–æFW‚²“°¢'&V³°¢Ğ¢Ğ¢–b†6÷VçBÓÒÇÂ÷WGWD6÷VçBâÖ†–×VÔ7W7FöÔ÷WGWG0¢ÇÂ6÷VçBâÖ†–×VÔ7W7FöÔ÷WGWG2Ò÷WGWD6÷VçB’°¢&WGW&âfÇ6S°¢Ğ¢f÷"‡7FC£§V–çC3%÷B–æFW‚Ò²–æFW‚Â6÷VçC²²¶–æFW‚’°¢6öç7B7FC£§6—¦U÷B'VæT–æFW‚Ò6†ö÷6U'VæT–æFW‚‚“°¢÷WGWG5¶÷WGWD6÷VçB²µÒÒÖ¶T÷WGWE7V2„Ö¶U'VæT6öFR€¢7FF–5ö67CÇ7FC£§V–çC3%÷Câ‡'VæT–æFW‚²’’À¢C%$Ã£¤—FV×3£¥VÆ—G“£¤æ÷&ÖÂÂÂC%$Ã£¤—FV×3£¤FVfVÇEfÇVR“°¢Ğ¢&WGW&âG'VS°§Ğ ¦WFòVæD7W7FöÔ÷WGWG2€¢7FC£¦'&“ÄC%$Ã£¤—FV×3£¤—FVÔ7&VFU7V2ÂÖ†–×VÔ7W7FöÔ÷WGWG3âb÷WGWG2À¢7FC£§6—¦U÷Bb÷WGWD6÷VçB’æöW†6WBÓâ&ööÂ°¢6öç7B7FC£§V–çC3%÷B6÷VçE&öÆÂĞ¢7FC£§Væ–f÷&Õö–çEöF—7G&–'WF–öãÇ7FC£§V–çC3%÷CâƒÂ’…&æFöÔVæv–æR“°¢7FC£§V–çC3%÷B7V×VÆF—fW·Ó°¢7FC£§V–çC3%÷B&æFöÔ÷WGWD6÷VçG·Ó°¢f÷"‡7FC£§6—¦U÷B–æFW‚Ò°¢–æFW‚Â6öæf–ræ7W7FöÒæ÷WGWD6÷VçEvV–v‡G2ç6—¦R‚“²²¶–æFW‚’°¢7V×VÆF—fR³Ò6öæf–ræ7W7FöÒæ÷WGWD6÷VçEvV–v‡G5¶–æFW…Ó°¢–b†6÷VçE&öÆÂÃÒ7V×VÆF—fR’°¢&æFöÔ÷WGWD6÷VçBÒ7FF–5ö67CÇ7FC£§V–çC3%÷Câ†–æFW‚²“°¢'&V³°¢Ğ¢Ğ¢6öç7B7FC£§6—¦U÷BFF—F–öæÄ6÷VçBÒ6öæf–ræ7W7FöÒæwV&çFVVD6÷Vç@¢²&æFöÔ÷WGWD6÷VçC°¢–b‡&æFöÔ÷WGWD6÷VçBÓÒÇÂ÷WGWD6÷VçBâÖ†–×VÔ7W7FöÔ÷WGWG0¢ÇÂFF—F–öæÄ6÷VçBâÖ†–×VÔ7W7FöÔ÷WGWG2Ò÷WGWD6÷VçB’°¢&WGW&âfÇ6S°¢Ğ ¢f÷"‡7FC£§6—¦U÷B–æFW‚Ò²–æFW‚Â6öæf–ræ7W7FöÒæ—FVÔ6÷VçC²²¶–æFW‚’°¢6öç7B7W7FöÔ÷WGWDVçG'’bVçG'’Ò6öæf–ræ7W7FöÒæ—FV×5¶–æFW…Ó°¢–b‚VçG'’æwV&çFVVB’6öçF–çVS°¢6öç7B7FC£§V–çC3%÷B6öFRÒ6†ö÷6T7W7FöÔ÷WGWD6öFR†VçG'’“°¢6öç7BWFòVÆ—G’Ò6†ö÷6T7W7FöÔ÷WGWEVÆ—G’†VçG'’Â6öFR“°¢÷WGWG5¶÷WGWD6÷VçB²µÒÒÖ¶T÷WGWE7V2†6öFRÂVÆ—G’À¢6öæf–ræ7W7FöÒæ—FVÔÆWfVÂÂVçG'’çVçF—G’“°¢Ğ¢f÷"‡7FC£§V–çC3%÷B–æFW‚Ò²–æFW‚Â&æFöÔ÷WGWD6÷VçC²²¶–æFW‚’°¢6öç7B7FC£§6—¦U÷B—FVÔ–æFW‚Ò6†ö÷6T7W7FöÔ—FVÔ–æFW‚‚“°¢6öç7B7W7FöÔ÷WGWDVçG'’bVçG'’Ò6öæf–ræ7W7FöÒæ—FV×5¶—FVÔ–æFW…Ó°¢6öç7B7FC£§V–çC3%÷B6öFRÒ6†ö÷6T7W7FöÔ÷WGWD6öFR†VçG'’“°¢6öç7BWFòVÆ—G’Ò6†ö÷6T7W7FöÔ÷WGWEVÆ—G’†VçG'’Â6öFR“°¢÷WGWG5¶÷WGWD6÷VçB²µÒÒÖ¶T÷WGWE7V2†6öFRÂVÆ—G’À¢6öæf–ræ7W7FöÒæ—FVÔÆWfVÂÂVçG'’çVçF—G’“°¢Ğ¢&WGW&âG'VS°§Ğ ¦WFòVæD÷WGWG4f÷$ÖöFR„÷WGWDÖöFRÖöFRÀ¢7FC£¦'&“ÄC%$Ã£¤—FV×3£¤—FVÔ7&VFU7V2ÂÖ†–×VÔ7W7FöÔ÷WGWG3âb÷WGWG2À¢7FC£§6—¦U÷Bb÷WGWD6÷VçB’æöW†6WBÓâ&ööÂ°¢&WGW&âÖöFRÓÒ÷WGWDÖöFS£¥'VæW0¢òVæE'VæT÷WGWG2†÷WGWG2Â÷WGWD6÷VçB¢¢VæD7W7FöÔ÷WGWG2†÷WGWG2Â÷WGWD6÷VçB“°§Ğ ¦WFò6öæf–uF‚‚’Óâ7FC£¦f–ÆW7—7FVÓ£§F‚°¢–b„6öçFW‡BÒçVÆÇG"bb6öçFW‡BÓçÇVv–ä6öæf–uF‚ÒçVÆÇG ¢bb6öçFW‡BÓçÇVv–ä6öæf–uF…³ÒÒÂuÃr’°¢&WGW&â7FC£¦f–ÆW7—7FVÓ£§F‚„6öçFW‡BÓçÇVv–ä6öæf–uF‚“°¢Ğ¢7FC£¦W'&÷%ö6öFRW'&÷#°¢6öç7BWFò7W'&VçBÒ7FC£¦f–ÆW7—7FVÓ£¦7W'&VçE÷F‚†W'&÷"“°¢–b†W'&÷"’&WGW&â·Ó°¢&WGW&â7W'&VçBòÂ&C'&ÆöFW""òÂ&6öæf–r"ò6öæf–tf–ÆTæÖS°§Ğ §7G'V7B§6öäö&¦V7E&ævR°¢7FC£§6—¦U÷B&Vv–ç·Ó°¢7FC£§6—¦U÷BVæG·Ó°§Ó° §7G'V7B§6öä'&•&ævR°¢7FC£§6—¦U÷B&Vv–ç·Ó°¢7FC£§6—¦U÷BVæG·Ó°§Ó° §7G'V7B§6öäÖVÖ&W$Æö6F–öâ°¢7FC£§6—¦U÷B¶W—·Ó°¢7FC£§6—¦U÷BfÇVW·Ó°§Ó° §fö–B6¶—§6öåv†—FW76R‡7FC£§7G&–æu÷f–Wr§6öâÂ7FC£§6—¦U÷Bb÷6—F–öâÀ¢7FC£§6—¦U÷BÆ–Ö—B’æöW†6WB°¢v†–ÆR‡÷6—F–öâÂÆ–Ö—Bbb†§6öå·÷6—F–öåÒÓÒrrÇÂ§6öå·÷6—F–öåÒÓÒuÇBp¢ÇÂ§6öå·÷6—F–öåÒÓÒuÇ"rÇÂ§6öå·÷6—F–öåÒÓÒuÆâr’’°¢²·÷6—F–öã°¢Ğ§Ğ ¦WFò&VD§6öå7G&–ær‡7FC£§7G&–æu÷f–Wr§6öâÂ7FC£§6—¦U÷BV÷FU÷6—F–öâÀ¢7FC£§6—¦U÷BÆ–Ö—BÂ7FC£§6—¦U÷BbgFW"’æöW†6W@¢Óâ7FC£¦÷F–öæÃÇ7FC£§7G&–æu÷f–Wsâ°¢–b‡V÷FU÷6—F–öâãÒÆ–Ö—BÇÂ§6öå·V÷FU÷6—F–öåÒÒr"r’&WGW&â7FC£¦çVÆÆ÷C°¢f÷"‡7FC£§6—¦U÷B÷6—F–öâÒV÷FU÷6—F–öâ²²÷6—F–öâÂÆ–Ö—C²²·÷6—F–öâ’°¢–b†§6öå·÷6—F–öåÒÓÒuÅÂr’°¢²·÷6—F–öã°¢ÒVÇ6R–b†§6öå·÷6—F–öåÒÓÒr"r’°¢gFW"Ò÷6—F–öâ²°¢&WGW&â§6öâç7V'7G"‡V÷FU÷6—F–öâ²À¢÷6—F–öâÒV÷FU÷6—F–öâÒ“°¢Ğ¢Ğ¢&WGW&â7FC£¦çVÆÆ÷C°§Ğ ¦WFòf–æDÖF6†–æt§6öä'&6R‡7FC£§7G&–æu÷f–Wr§6öâÂ7FC£§6—¦U÷B÷Væ–ærÀ¢7FC£§6—¦U÷BÆ–Ö—B’æöW†6WBÓâ7FC£¦÷F–öæÃÇ7FC£§6—¦U÷Câ°¢–b†÷Væ–ærãÒÆ–Ö—BÇÂ§6öå¶÷Væ–æuÒÒw²r’&WGW&â7FC£¦çVÆÆ÷C°¢7FC£§6—¦U÷BFWF‡·Ó°¢&ööÂ–å7G&–æw·Ó°¢&ööÂW66VG·Ó°¢f÷"‡7FC£§6—¦U÷B÷6—F–öâÒ÷Væ–æs²÷6—F–öâÂÆ–Ö—C²²·÷6—F–öâ’°¢6öç7B6†"7W'&VçBÒ§6öå·÷6—F–öåÓ°¢–b†–å7G&–ær’°¢–b†W66VB’°¢W66VBÒfÇ6S°¢ÒVÇ6R–b†7W'&VçBÓÒuÅÂr’°¢W66VBÒG'VS°¢ÒVÇ6R–b†7W'&VçBÓÒr"r’°¢–å7G&–ærÒfÇ6S°¢Ğ¢6öçF–çVS°¢Ğ¢–b†7W'&VçBÓÒr"r’°¢–å7G&–ærÒG'VS°¢ÒVÇ6R–b†7W'&VçBÓÒw²r’°¢²¶FWFƒ°¢ÒVÇ6R–b†7W'&VçBÓÒwÒrbbÒÖFWF‚ÓÒ’°¢&WGW&â÷6—F–öã°¢Ğ¢Ğ¢&WGW&â7FC£¦çVÆÆ÷C°§Ğ ¦WFòf–æDæÖVD§6öäö&¦V7B‡7FC£§7G&–æu÷f–Wr§6öâÂ7FC£§7G&–æu÷f–WræÖR¢Óâ7FC£¦÷F–öæÃÄ§6öäö&¦V7E&ævSâ°¢7FC£§fV7F÷#Ç7FC£§6—¦U÷Câö&¦V7E7F6³°¢f÷"‡7FC£§6—¦U÷B÷6—F–öâÒ²÷6—F–öâÂ§6öâç6—¦R‚“²’°¢–b†§6öå·÷6—F–öåÒÓÒr"r’°¢7FC£§6—¦U÷BgFW$¶W—·Ó°¢6öç7BWFò7G&–æufÇVRÒ&VD§6öå7G&–ær†§6öâÂ÷6—F–öâÀ¢§6öâç6—¦R‚’ÂgFW$¶W’“°¢–b‚7G&–æufÇVR’&WGW&â7FC£¦çVÆÆ÷C°¢–b‚§7G&–æufÇVRÓÒ&æÖR"bbö&¦V7E7F6²æV×G’‚’’°¢7FC£§6—¦U÷BfÇVU÷6—F–öâÒgFW$¶W“°¢6¶—§6öåv†—FW76R†§6öâÂfÇVU÷6—F–öâÂ§6öâç6—¦R‚’“°¢–b‡fÇVU÷6—F–öâÂ§6öâç6—¦R‚¢bb§6öå·fÇVU÷6—F–öåÒÓÒs¢r’°¢²·fÇVU÷6—F–öã°¢6¶—§6öåv†—FW76R†§6öâÂfÇVU÷6—F–öâÂ§6öâç6—¦R‚’“°¢7FC£§6—¦U÷BgFW%fÇVW·Ó°¢6öç7BWFòfÇVRÒ&VD§6öå7G&–ær†§6öâÂfÇVU÷6—F–öâÀ¢§6öâç6—¦R‚’ÂgFW%fÇVR“°¢–b‡fÇVRbb§fÇVRÓÒæÖR’°¢6öç7B7FC£§6—¦U÷Bö&¦V7E7F'BÒö&¦V7E7F6²æ&6²‚“°¢6öç7BWFòö&¦V7DVæBÒf–æDÖF6†–æt§6öä'&6R†§6öâÀ¢ö&¦V7E7F'BÂ§6öâç6—¦R‚’“°¢–b‚ö&¦V7DVæB’&WGW&â7FC£¦çVÆÆ÷C°¢&WGW&â§6öäö&¦V7E&ævW¶ö&¦V7E7F'BÂ¦ö&¦V7DVæGÓ°¢Ğ¢Ğ¢Ğ¢÷6—F–öâÒgFW$¶W“°¢6öçF–çVS°¢Ğ¢–b†§6öå·÷6—F–öåÒÓÒw²r’°¢ö&¦V7E7F6²çW6…ö&6²‡÷6—F–öâ“°¢ÒVÇ6R–b†§6öå·÷6—F–öåÒÓÒwÒrbbö&¦V7E7F6²æV×G’‚’’°¢ö&¦V7E7F6²ç÷ö&6²‚“°¢Ğ¢²·÷6—F–öã°¢Ğ¢&WGW&â7FC£¦çVÆÆ÷C°§Ğ ¦WFòf–æDF—&V7D§6öäÖVÖ&W"‡7FC£§7G&–æu÷f–Wr§6öâÂ§6öäö&¦V7E&ævRö&¦V7BÀ¢7FC£§7G&–æu÷f–Wr¶W’’æöW†6WBÓâ7FC£¦÷F–öæÃÄ§6öäÖVÖ&W$Æö6F–öãâ°¢7FC£§6—¦U÷BæW7FVDFWF‡·Ó°¢f÷"‡7FC£§6—¦U÷B÷6—F–öâÒö&¦V7Bæ&Vv–â²²÷6—F–öâÂö&¦V7BæVæC²’°¢–b†§6öå·÷6—F–öåÒÓÒr"r’°¢7FC£§6—¦U÷BgFW$¶W—·Ó°¢6öç7BWFò7G&–æufÇVRÒ&VD§6öå7G&–ær†§6öâÂ÷6—F–öâÀ¢ö&¦V7BæVæBÂgFW$¶W’“°¢–b‚7G&–æufÇVR’&WGW&â7FC£¦çVÆÆ÷C°¢–b†æW7FVDFWF‚ÓÒbb§7G&–æufÇVRÓÒ¶W’’°¢7FC£§6—¦U÷BfÇVU÷6—F–öâÒgFW$¶W“°¢6¶—§6öåv†—FW76R†§6öâÂfÇVU÷6—F–öâÂö&¦V7BæVæB“°¢–b‡fÇVU÷6—F–öâãÒö&¦V7BæVæBÇÂ§6öå·fÇVU÷6—F–öåÒÒs¢r’°¢&WGW&â7FC£¦çVÆÆ÷C°¢Ğ¢²·fÇVU÷6—F–öã°¢6¶—§6öåv†—FW76R†§6öâÂfÇVU÷6—F–öâÂö&¦V7BæVæB“°¢&WGW&â§6öäÖVÖ&W$Æö6F–öç·÷6—F–öâÂfÇVU÷6—F–öçÓ°¢Ğ¢÷6—F–öâÒgFW$¶W“°¢6öçF–çVS°¢Ğ¢–b†§6öå·÷6—F–öåÒÓÒw²rÇÂ§6öå·÷6—F–öåÒÓÒu²r’°¢²¶æW7FVDFWFƒ°¢ÒVÇ6R–b‚†§6öå·÷6—F–öåÒÓÒwÒrÇÂ§6öå·÷6—F–öåÒÓÒuÒr¢bbæW7FVDFWF‚â’°¢ÒÖæW7FVDFWFƒ°¢Ğ¢²·÷6—F–öã°¢Ğ¢&WGW&â7FC£¦çVÆÆ÷C°§Ğ ¦WFòf–æD§6öäö&¦V7DÖVÖ&W"‡7FC£§7G&–æu÷f–Wr§6öâÂ§6öäö&¦V7E&ævRö&¦V7BÀ¢7FC£§7G&–æu÷f–Wr¶W’’æöW†6WBÓâ7FC£¦÷F–öæÃÄ§6öäö&¦V7E&ævSâ°¢6öç7BWFòÖVÖ&W"Òf–æDF—&V7D§6öäÖVÖ&W"†§6öâÂö&¦V7BÂ¶W’“°¢–b‚ÖVÖ&W"ÇÂÖVÖ&W"ÓçfÇVRãÒö&¦V7BæVæBÇÂ§6öå¶ÖVÖ&W"ÓçfÇVUÒÒw²r’°¢&WGW&â7FC£¦çVÆÆ÷C°¢Ğ¢6öç7BWFòVæBÒf–æDÖF6†–æt§6öä'&6R†§6öâÂÖVÖ&W"ÓçfÇVRÂö&¦V7BæVæB²“°¢–b‚VæB’&WGW&â7FC£¦çVÆÆ÷C°¢&WGW&â§6öäö&¦V7E&ævW¶ÖVÖ&W"ÓçfÇVRÂ¦VæGÓ°§Ğ ¦WFò&VDF—&V7D§6öå7G&–ær‡7FC£§7G&–æu÷f–Wr§6öâÂ§6öäö&¦V7E&ævRö&¦V7BÀ¢7FC£§7G&–æu÷f–Wr¶W’’Óâ7FC£¦÷F–öæÃÇ7FC£§7G&–æsâ°¢6öç7BWFòÖVÖ&W"Òf–æDF—&V7D§6öäÖVÖ&W"†§6öâÂö&¦V7BÂ¶W’“°¢–b‚ÖVÖ&W"’&WGW&â7FC£¦çVÆÆ÷C°¢7FC£§6—¦U÷BgFW%fÇVW·Ó°¢6öç7BWFòfÇVRÒ&VD§6öå7G&–ær†§6öâÂÖVÖ&W"ÓçfÇVRÂö&¦V7BæVæBÀ¢gFW%fÇVR“°¢&WGW&âfÇVRò7FC£¦÷F–öæÃÇ7FC£§7G&–æsâ‡7FC£§7G&–ær‚§fÇVR’¢¢7FC£¦çVÆÆ÷C°§Ğ ¦WFòf–æD6öçfW'D'WGFöâ‡7FC£§7G&–æu÷f–Wr§6öâÂ7FC£§7G&–æu÷f–Wr6Æ–6´ÖW76vR¢Óâ7FC£¦÷F–öæÃÄ§6öäö&¦V7E&ævSâ°¢7FC£§fV7F÷#Ç7FC£§6—¦U÷Câö&¦V7E7F6³°¢f÷"‡7FC£§6—¦U÷B÷6—F–öâÒ²÷6—F–öâÂ§6öâç6—¦R‚“²’°¢–b†§6öå·÷6—F–öåÒÓÒr"r’°¢7FC£§6—¦U÷BgFW$¶W—·Ó°¢6öç7BWFò7G&–æufÇVRÒ&VD§6öå7G&–ær†§6öâÂ÷6—F–öâÀ¢§6öâç6—¦R‚’ÂgFW$¶W’“°¢–b‚7G&–æufÇVR’&WGW&â7FC£¦çVÆÆ÷C°¢–b‚§7G&–æufÇVRÓÒ&öä6Æ–6´ÖW76vR"bbö&¦V7E7F6²ç6—¦R‚’ãÒ"’°¢7FC£§6—¦U÷BfÇVU÷6—F–öâÒgFW$¶W“°¢6¶—§6öåv†—FW76R†§6öâÂfÇVU÷6—F–öâÂ§6öâç6—¦R‚’“°¢–b‡fÇVU÷6—F–öâÂ§6öâç6—¦R‚¢bb§6öå·fÇVU÷6—F–öåÒÓÒs¢r’°¢²·fÇVU÷6—F–öã°¢6¶—§6öåv†—FW76R†§6öâÂfÇVU÷6—F–öâÂ§6öâç6—¦R‚’“°¢7FC£§6—¦U÷BgFW%fÇVW·Ó°¢6öç7BWFòfÇVRÒ&VD§6öå7G&–ær†§6öâÂfÇVU÷6—F–öâÀ¢§6öâç6—¦R‚’ÂgFW%fÇVR“°¢–b‡fÇVRbb§fÇVRÓÒ6Æ–6´ÖW76vR’°¢6öç7B7FC£§6—¦U÷Bv–FvWE7F'BĞ¢ö&¦V7E7F6µ¶ö&¦V7E7F6²ç6—¦R‚’Ò%Ó°¢6öç7BWFòv–FvWDVæBÒf–æDÖF6†–æt§6öä'&6R†§6öâÀ¢v–FvWE7F'BÂ§6öâç6—¦R‚’“°¢–b‚v–FvWDVæB’&WGW&â7FC£¦çVÆÆ÷C°¢6öç7B§6öäö&¦V7E&ævRv–FvWG·v–FvWE7F'BÂ§v–FvWDVæGÓ°¢6öç7BWFòG—RÒ&VDF—&V7D§6öå7G&–ær†§6öâÂv–FvWBÀ¢'G—R"“°¢–b‡G—Rbb§G—RÓÒ$'WGFöåv–FvWB"’°¢&WGW&âv–FvWC°¢Ğ¢Ğ¢Ğ¢Ğ¢÷6—F–öâÒgFW$¶W“°¢6öçF–çVS°¢Ğ¢–b†§6öå·÷6—F–öåÒÓÒw²r’°¢ö&¦V7E7F6²çW6…ö&6²‡÷6—F–öâ“°¢ÒVÇ6R–b†§6öå·÷6—F–öåÒÓÒwÒrbbö&¦V7E7F6²æV×G’‚’’°¢ö&¦V7E7F6²ç÷ö&6²‚“°¢Ğ¢²·÷6—F–öã°¢Ğ¢&WGW&â7FC£¦çVÆÆ÷C°§Ğ ¦WFòf–æD–ææW&Ö÷7D'&”&Vf÷&R‡7FC£§7G&–æu÷f–Wr§6öâÂ7FC£§6—¦U÷B÷6—F–öâ¢Óâ7FC£¦÷F–öæÃÇ7FC£§6—¦U÷Câ°¢7FC£§fV7F÷#Ç7FC£§6—¦U÷Câ'&•7F6³°¢f÷"‡7FC£§6—¦U÷B7W'6÷"Ò²7W'6÷"Â÷6—F–öã²’°¢–b†§6öå¶7W'6÷%ÒÓÒr"r’°¢7FC£§6—¦U÷BgFW%7G&–æw·Ó°¢–b‚&VD§6öå7G&–ær†§6öâÂ7W'6÷"Â÷6—F–öâÂgFW%7G&–ær’’°¢&WGW&â7FC£¦çVÆÆ÷C°¢Ğ¢7W'6÷"ÒgFW%7G&–æs°¢6öçF–çVS°¢Ğ¢–b†§6öå¶7W'6÷%ÒÓÒu²r’°¢'&•7F6²çW6…ö&6²†7W'6÷"“°¢ÒVÇ6R–b†§6öå¶7W'6÷%ÒÓÒuÒrbb'&•7F6²æV×G’‚’’°¢'&•7F6²ç÷ö&6²‚“°¢Ğ¢²¶7W'6÷#°¢Ğ¢–b†'&•7F6²æV×G’‚’’&WGW&â7FC£¦çVÆÆ÷C°¢&WGW&â'&•7F6²æ&6²‚“°§Ğ ¦WFòf–æDÖF6†–æt§6öä'&6¶WB‡7FC£§7G&–æu÷f–Wr§6öâÂ7FC£§6—¦U÷B÷Væ–ærÀ¢7FC£§6—¦U÷BÆ–Ö—B’Óâ7FC£¦÷F–öæÃÇ7FC£§6—¦U÷Câ°¢–b†÷Væ–ærãÒÆ–Ö—BÇÂ§6öå¶÷Væ–æuÒÒu²r’&WGW&â7FC£¦çVÆÆ÷C°¢7FC£§6—¦U÷BFWF‡·Ó°¢f÷"‡7FC£§6—¦U÷B÷6—F–öâÒ÷Væ–æs²÷6—F–öâÂÆ–Ö—C²’°¢–b†§6öå·÷6—F–öåÒÓÒr"r’°¢7FC£§6—¦U÷BgFW%7G&–æw·Ó°¢–b‚&VD§6öå7G&–ær†§6öâÂ÷6—F–öâÂÆ–Ö—BÂgFW%7G&–ær’’°¢&WGW&â7FC£¦çVÆÆ÷C°¢Ğ¢÷6—F–öâÒgFW%7G&–æs°¢6öçF–çVS°¢Ğ¢–b†§6öå·÷6—F–öåÒÓÒu²r’°¢²¶FWFƒ°¢ÒVÇ6R–b†§6öå·÷6—F–öåÒÓÒuÒrbbÒÖFWF‚ÓÒ’°¢&WGW&â÷6—F–öã°¢Ğ¢²·÷6—F–öã°¢Ğ¢&WGW&â7FC£¦çVÆÆ÷C°§Ğ ¦WFòf–æD§6öä'&”ÖVÖ&W"‡7FC£§7G&–æu÷f–Wr§6öâÂ§6öäö&¦V7E&ævRö&¦V7BÀ¢7FC£§7G&–æu÷f–Wr¶W’’Óâ7FC£¦÷F–öæÃÄ§6öä'&•&ævSâ°¢6öç7BWFòÖVÖ&W"Òf–æDF—&V7D§6öäÖVÖ&W"†§6öâÂö&¦V7BÂ¶W’“°¢–b‚ÖVÖ&W"ÇÂÖVÖ&W"ÓçfÇVRãÒö&¦V7BæVæBÇÂ§6öå¶ÖVÖ&W"ÓçfÇVUÒÒu²r’°¢&WGW&â7FC£¦çVÆÆ÷C°¢Ğ¢6öç7BWFòVæBÒf–æDÖF6†–æt§6öä'&6¶WB†§6öâÂÖVÖ&W"ÓçfÇVRÀ¢ö&¦V7BæVæB²“°¢–b‚VæB’&WGW&â7FC£¦çVÆÆ÷C°¢&WGW&â§6öä'&•&ævW¶ÖVÖ&W"ÓçfÇVRÂ¦VæGÓ°§Ğ ¦WFò—4§6öåv†—FW76R†6†"fÇVR’æöW†6WBÓâ&ööÂ°¢&WGW&âfÇVRÓÒrrÇÂfÇVRÓÒuÇBrÇÂfÇVRÓÒuÇ"rÇÂfÇVRÓÒuÆâs°§Ğ ¦WFò§6öä–æFVçFF–öäB‡7FC£§7G&–æu÷f–Wr§6öâÂ7FC£§6—¦U÷B÷6—F–öâ¢Óâ7FC£§7G&–ær°¢6öç7B7FC£§6—¦U÷BÆ–æU7F'BÒ§6öâç&f–æB‚uÆârÂ÷6—F–öâ“°¢6öç7B7FC£§6—¦U÷B–æFVçFF–öå7F'BÒÆ–æU7F'BÓÒ7FC£§7G&–æu÷f–Ws£¦ç÷0¢ò¢Æ–æU7F'B²°¢7FC£§6—¦U÷B–æFVçFF–öäVæBÒ–æFVçFF–öå7F'C°¢v†–ÆR†–æFVçFF–öäVæBÂ÷6—F–öà¢bb†§6öå¶–æFVçFF–öäVæEÒÓÒrrÇÂ§6öå¶–æFVçFF–öäVæEÒÓÒuÇBr’’°¢²¶–æFVçFF–öäVæC°¢Ğ¢&WGW&â7FC£§7G&–ær†§6öâç7V'7G"†–æFVçFF–öå7F'BÀ¢–æFVçFF–öäVæBÒ–æFVçFF–öå7F'B’“°§Ğ ¦WFò&V–æFVçD§6öäö&¦V7B‡7FC£§7G&–æu÷f–Wrö&¦V7BÀ¢7FC£§7G&–æu÷f–Wr6÷W&6T–æFVçBÂ7FC£§7G&–æu÷f–WrF&vWD–æFVçBÀ¢7FC£§7G&–æu÷f–WræWvÆ–æR’Óâ7FC£§7G&–ær°¢7FC£§fV7F÷#Ç7FC£§7G&–æu÷f–WsâÆ–æW3°¢f÷"‡7FC£§6—¦U÷B7F'BÒ²7F'BÃÒö&¦V7Bç6—¦R‚“²’°¢6öç7B7FC£§6—¦U÷BVæBÒö&¦V7Bæf–æB‚uÆârÂ7F'B“°¢6öç7B7FC£§6—¦U÷BÆ–æTVæBÒVæBÓÒ7FC£§7G&–æu÷f–Ws£¦ç÷0¢òö&¦V7Bç6—¦R‚’¢VæC°¢7FC£§6—¦U÷B6öçFVçDVæBÒÆ–æTVæC°¢–b†6öçFVçDVæBâ7F'Bbbö&¦V7E¶6öçFVçDVæBÒÒÓÒuÇ"r’°¢ÒÖ6öçFVçDVæC°¢Ğ¢Æ–æW2çW6…ö&6²†ö&¦V7Bç7V'7G"‡7F'BÂ6öçFVçDVæBÒ7F'B’“°¢–b†VæBÓÒ7FC£§7G&–æu÷f–Ws£¦ç÷2’'&V³°¢7F'BÒVæB²°¢Ğ¢–b†Æ–æW2æV×G’‚’’&WGW&â·Ó° ¢7FC£§7G&–ærf÷&ÖGFVC°¢f÷&ÖGFVBç&W6W'fR†ö&¦V7Bç6—¦R‚’²F&vWD–æFVçBç6—¦R‚’¢Æ–æW2ç6—¦R‚’“°¢f÷"‡7FC£§6—¦U÷B–æFW‚Ò²–æFW‚ÂÆ–æW2ç6—¦R‚“²²¶–æFW‚’°¢–b†–æFW‚Ò’f÷&ÖGFVBæVæB†æWvÆ–æR“°¢f÷&ÖGFVBæVæB‡F&vWD–æFVçB“°¢WFòÆ–æRÒÆ–æW5¶–æFW…Ó°¢–b†–æFW‚Òbb6÷W&6T–æFVçBæV×G’‚¢bbÆ–æRç7F'G5÷v—F‚‡6÷W&6T–æFVçB’’°¢Æ–æRç&VÖ÷fU÷&Vf—‚‡6÷W&6T–æFVçBç6—¦R‚’“°¢Ğ¢f÷&ÖGFVBæVæB†Æ–æR“°¢Ğ¢&WGW&âf÷&ÖGFVC°§Ğ ¦WFòVæD§6öä'&”ö&¦V7B‡7FC£§7G&–ærb§6öâÂ§6öä'&•&ævR'&’À¢7FC£§7G&–æu÷f–Wr6W&–Æ—¦VDö&¦V7BÀ¢7FC£§7G&–æu÷f–Wr6÷W&6T–æFVçBÒ·Ò’Óâ&ööÂ°¢–b†'&’æ&Vv–âãÒ'&’æVæBÇÂ'&’æVæBãÒ§6öâç6—¦R‚¢ÇÂ§6öå¶'&’æ&Vv–åÒÒu²rÇÂ§6öå¶'&’æVæEÒÒuÒr’°¢&WGW&âfÇ6S°¢Ğ¢7FC£§6—¦U÷Bf—'7D6öçFVçBÒ'&’æ&Vv–â²°¢6¶—§6öåv†—FW76R†§6öâÂf—'7D6öçFVçBÂ'&’æVæB“°¢6öç7B7FC£§7G&–æræWvÆ–æRÒ§6öâæf–æB‚%Ç%Æâ"’Ò7FC£§7G&–æs£¦ç÷0¢ò%Ç%Æâ"¢%Æâ#°¢6öç7B7FC£§7G&–ær'&”–æFVçBÒ§6öä–æFVçFF–öäB†§6öâÂ'&’æ&Vv–â“°¢6öç7B7FC£§7G&–ær—FVÔ–æFVçBÒ'&”–æFVçB²"#°¢6öç7B7FC£§7G&–ær–æFVçFVDö&¦V7BÒ&V–æFVçD§6öäö&¦V7B‡6W&–Æ—¦VDö&¦V7BÀ¢6÷W&6T–æFVçBÂ—FVÔ–æFVçBÂæWvÆ–æR“°¢–b†–æFVçFVDö&¦V7BæV×G’‚’’&WGW&âfÇ6S° ¢–b†f—'7D6öçFVçBÓÒ'&’æVæB’°¢§6öâæ–ç6W'B†'&’æ&Vv–â²ÂæWvÆ–æR²–æFVçFVDö&¦V7B²æWvÆ–æP¢²'&”–æFVçB“°¢&WGW&âG'VS°¢Ğ ¢7FC£§6—¦U÷BÆ7D6öçFVçBÒ'&’æVæC°¢v†–ÆR†Æ7D6öçFVçBâ'&’æ&Vv–â²¢bb—4§6öåv†—FW76R†§6öå¶Æ7D6öçFVçBÒÒ’’°¢ÒÖÆ7D6öçFVçC°¢Ğ¢–b†Æ7D6öçFVçBÃÒ'&’æ&Vv–â²’&WGW&âfÇ6S°¢§6öâæ–ç6W'B†Æ7D6öçFVçBÂ"Â"²æWvÆ–æR²–æFVçFVDö&¦V7B“°¢&WGW&âG'VS°§Ğ ¦WFòVæD§6öä'&”ÖVÖ&W"‡7FC£§7G&–ærb§6öâÂ§6öäö&¦V7E&ævRö&¦V7BÀ¢7FC£§7G&–æu÷f–WrÖVÖ&W$æÖRÂ7FC£§7G&–æu÷f–Wr6W&–Æ—¦VDö&¦V7BÀ¢7FC£§7G&–æu÷f–Wr6÷W&6T–æFVçBÒ·Ò¢Óâ&ööÂ°¢–b„f–æDF—&V7D§6öäÖVÖ&W"†§6öâÂö&¦V7BÂÖVÖ&W$æÖR’’°¢6öç7BWFò'&’Òf–æD§6öä'&”ÖVÖ&W"†§6öâÂö&¦V7BÂÖVÖ&W$æÖR“°¢&WGW&â'&’bbVæD§6öä'&”ö&¦V7B†§6öâÂ¦'&’Â6W&–Æ—¦VDö&¦V7BÀ¢6÷W&6T–æFVçB“°¢Ğ¢–b†ö&¦V7Bæ&Vv–âãÒö&¦V7BæVæBÇÂö&¦V7BæVæBãÒ§6öâç6—¦R‚¢ÇÂ§6öå¶ö&¦V7BæVæEÒÒwÒr’°¢&WGW&âfÇ6S°¢Ğ ¢7FC£§6—¦U÷B–ç6W'F–öâÒö&¦V7BæVæC°¢v†–ÆR†–ç6W'F–öââö&¦V7Bæ&Vv–â²¢bb—4§6öåv†—FW76R†§6öå¶–ç6W'F–öâÒÒ’’°¢ÒÖ–ç6W'F–öã°¢Ğ¢6öç7B&ööÂ†4ÖVÖ&W'2Ò–ç6W'F–öââö&¦V7Bæ&Vv–â²¢bb§6öå¶–ç6W'F–öâÒÒÒw²s°¢6öç7B7FC£§7G&–æræWvÆ–æRÒ§6öâæf–æB‚%Ç%Æâ"’Ò7FC£§7G&–æs£¦ç÷0¢ò%Ç%Æâ"¢%Æâ#°¢6öç7B7FC£§7G&–ærö&¦V7D–æFVçBÒ§6öä–æFVçFF–öäB†§6öâÂö&¦V7Bæ&Vv–â“°¢6öç7B7FC£§7G&–ærÖVÖ&W$–æFVçBÒö&¦V7D–æFVçB²"#°¢6öç7B7FC£§7G&–ær6†–ÆD–æFVçBÒÖVÖ&W$–æFVçB²"#°¢6öç7B7FC£§7G&–ær–æFVçFVDö&¦V7BÒ&V–æFVçD§6öäö&¦V7B‡6W&–Æ—¦VDö&¦V7BÀ¢6÷W&6T–æFVçBÂ6†–ÆD–æFVçBÂæWvÆ–æR“°¢–b†–æFVçFVDö&¦V7BæV×G’‚’’&WGW&âfÇ6S° ¢7FC£§7G&–ærFF—F–öâÒ†4ÖVÖ&W'2ò"Â"¢"#°¢FF—F–öâ³ÒæWvÆ–æR²ÖVÖ&W$–æFVçB²%Â""²7FC£§7G&–ær†ÖVÖ&W$æÖR¢²%Â#¢²"²æWvÆ–æR²–æFVçFVDö&¦V7@¢²æWvÆ–æR²ÖVÖ&W$–æFVçB²%Ò#°¢§6öâæ–ç6W'B†–ç6W'F–öâÂFF—F–öâ“°¢&WGW&âG'VS°§Ğ ¦WFò–ç6W'D§6öä'&”ö&¦V7DgFW"‡7FC£§7G&–ærb§6öâÂ§6öäö&¦V7E&ævRö&¦V7BÀ¢7FC£§7G&–æu÷f–Wr6W&–Æ—¦VDö&¦V7B’Óâ&ööÂ°¢6öç7BWFò'&”÷Væ–ærÒf–æD–ææW&Ö÷7D'&”&Vf÷&R†§6öâÂö&¦V7Bæ&Vv–â“°¢–b‚'&”÷Væ–ær’&WGW&âfÇ6S°¢6öç7BWFò'&”VæBÒf–æDÖF6†–æt§6öä'&6¶WB†§6öâÂ¦'&”÷Væ–ærÀ¢§6öâç6—¦R‚’“°¢–b‚'&”VæBÇÂö&¦V7BæVæBãÒ¦'&”VæB’&WGW&âfÇ6S° ¢6öç7B7FC£§6—¦U÷BÆ–æU7F'BÒ§6öâç&f–æB‚uÆârÂö&¦V7Bæ&Vv–â“°¢6öç7B7FC£§6—¦U÷B–æFVçFF–öå7F'BÒÆ–æU7F'BÓÒ7FC£§7G&–æs£¦ç÷0¢ò¢Æ–æU7F'B²°¢7FC£§7G&–ær–æFVçFF–öâÒ§6öâç7V'7G"†–æFVçFF–öå7F'BÀ¢ö&¦V7Bæ&Vv–âÒ–æFVçFF–öå7F'B“°¢–b†–æFVçFF–öâæf–æEöf—'7Eöæ÷Eööb‚"ÇB"’Ò7FC£§7G&–æs£¦ç÷2’°¢–æFVçFF–öâæ6ÆV"‚“°¢Ğ¢6öç7B7FC£§7G&–æræWvÆ–æRÒ§6öâæf–æB‚%Ç%Æâ"’Ò7FC£§7G&–æs£¦ç÷0¢ò%Ç%Æâ"¢%Æâ#° ¢7FC£§6—¦U÷BgFW$ö&¦V7BÒö&¦V7BæVæB²°¢6¶—§6öåv†—FW76R†§6öâÂgFW$ö&¦V7BÂ¦'&”VæB“°¢–b†gFW$ö&¦V7BÂ¦'&”VæBbb§6öå¶gFW$ö&¦V7EÒÓÒrÂr’°¢§6öâæ–ç6W'B†gFW$ö&¦V7B²ÂæWvÆ–æR²–æFVçFF–öà¢²7FC£§7G&–ær‡6W&–Æ—¦VDö&¦V7B’²"Â"“°¢&WGW&âG'VS°¢Ğ¢–b†gFW$ö&¦V7BÒ¦'&”VæB’&WGW&âfÇ6S°¢§6öâæ–ç6W'B†ö&¦V7BæVæB²Â"Â"²æWvÆ–æR²–æFVçFF–öà¢²7FC£§7G&–ær‡6W&–Æ—¦VDö&¦V7B’“°¢&WGW&âG'VS°§Ğ ¦WFò§6öå66Æ$VæB‡7FC£§7G&–æu÷f–Wr§6öâÂ7FC£§6—¦U÷B7F'BÀ¢7FC£§6—¦U÷BÆ–Ö—B’æöW†6WBÓâ7FC£¦÷F–öæÃÇ7FC£§6—¦U÷Câ°¢–b‡7F'BãÒÆ–Ö—B’&WGW&â7FC£¦çVÆÆ÷C°¢–b†§6öå·7F'EÒÓÒr"r’°¢7FC£§6—¦U÷BgFW'·Ó°¢–b‚&VD§6öå7G&–ær†§6öâÂ7F'BÂÆ–Ö—BÂgFW"’’&WGW&â7FC£¦çVÆÆ÷C°¢&WGW&âgFW#°¢Ğ¢7FC£§6—¦U÷BVæBÒ7F'C°¢v†–ÆR†VæBÂÆ–Ö—Bbb§6öå¶VæEÒÒrÂrbb§6öå¶VæEÒÒwÒp¢bb§6öå¶VæEÒÒuÒr’°¢²¶VæC°¢Ğ¢v†–ÆR†VæBâ7F'Bbb†§6öå¶VæBÒÒÓÒrrÇÂ§6öå¶VæBÒÒÓÒuÇBp¢ÇÂ§6öå¶VæBÒÒÓÒuÇ"rÇÂ§6öå¶VæBÒÒÓÒuÆâr’’°¢ÒÖVæC°¢Ğ¢&WGW&âVæBâ7F'Bò7FC£¦÷F–öæÃÇ7FC£§6—¦U÷Câ†VæB’¢7FC£¦çVÆÆ÷C°§Ğ ¦WFò&VDæÖVEv–FvWE&V7D6ö÷&F–æFR‡7FC£§7G&–æu÷f–Wr§6öâÀ¢7FC£§7G&–æu÷f–Wrv–FvWDæÖRÂ7FC£§7G&–æu÷f–Wr6ö÷&F–æFR¢Óâ7FC£¦÷F–öæÃÇ7FC£¦–çC3%÷Câ°¢6öç7BWFòv–FvWBÒf–æDæÖVD§6öäö&¦V7B†§6öâÂv–FvWDæÖR“°¢–b‚v–FvWB’&WGW&â7FC£¦çVÆÆ÷C°¢6öç7BWFòf–VÆG2Òf–æD§6öäö&¦V7DÖVÖ&W"†§6öâÂ§v–FvWBÂ&f–VÆG2"“°¢–b‚f–VÆG2’&WGW&â7FC£¦çVÆÆ÷C°¢6öç7BWFò&V7BÒf–æD§6öäö&¦V7DÖVÖ&W"†§6öâÂ¦f–VÆG2Â'&V7B"“°¢–b‚&V7B’&WGW&â7FC£¦çVÆÆ÷C°¢6öç7BWFòÖVÖ&W"Òf–æDF—&V7D§6öäÖVÖ&W"†§6öâÂ§&V7BÂ6ö÷&F–æFR“°¢–b‚ÖVÖ&W"’&WGW&â7FC£¦çVÆÆ÷C°¢6öç7BWFòVæBÒ§6öå66Æ$VæB†§6öâÂÖVÖ&W"ÓçfÇVRÂ&V7BÓæVæB“°¢–b‚VæB’&WGW&â7FC£¦çVÆÆ÷C°¢7FC£¦–çC3%÷BfÇVW·Ó°¢6öç7BWFò'6VBÒ7FC£¦g&öÕö6†'2†§6öâæFF‚’²ÖVÖ&W"ÓçfÇVRÀ¢§6öâæFF‚’²¦VæBÂfÇVR“°¢–b‡'6VBæV2Ò7FC£¦W'&7·ÒÇÂ'6VBçG"Ò§6öâæFF‚’²¦VæB’°¢&WGW&â7FC£¦çVÆÆ÷C°¢Ğ¢&WGW&âfÇVS°§Ğ ¦WFò6WDæÖVEv–FvWE&V7E÷6—F–öâ‡7FC£§7G&–ærb§6öâÀ¢7FC£§7G&–æu÷f–Wrv–FvWDæÖRÂ7FC£¦–çC3%÷B‚À¢7FC£¦–çC3%÷B’’Óâ&ööÂ°¢6öç7BWFò6WD6ö÷&F–æFRÒ²eÒ‡7FC£§7G&–æu÷f–Wr6ö÷&F–æFRÀ¢7FC£¦–çC3%÷BfÇVR’Óâ&ööÂ°¢6öç7BWFòv–FvWBÒf–æDæÖVD§6öäö&¦V7B†§6öâÂv–FvWDæÖR“°¢–b‚v–FvWB’&WGW&âfÇ6S°¢6öç7BWFòf–VÆG2Òf–æD§6öäö&¦V7DÖVÖ&W"†§6öâÂ§v–FvWBÂ&f–VÆG2"“°¢–b‚f–VÆG2’&WGW&âfÇ6S°¢6öç7BWFò&V7BÒf–æD§6öäö&¦V7DÖVÖ&W"†§6öâÂ¦f–VÆG2Â'&V7B"“°¢–b‚&V7B’&WGW&âfÇ6S°¢6öç7BWFòÖVÖ&W"Òf–æDF—&V7D§6öäÖVÖ&W"†§6öâÂ§&V7BÂ6ö÷&F–æFR“°¢–b‚ÖVÖ&W"’&WGW&âfÇ6S°¢6öç7BWFòVæBÒ§6öå66Æ$VæB†§6öâÂÖVÖ&W"ÓçfÇVRÂ&V7BÓæVæB“°¢–b‚VæB’&WGW&âfÇ6S°¢6öç7B7FC£§7G&–ær&WÆ6VÖVçBÒ7FC£§Fõ÷7G&–ær‡fÇVR“°¢–b‡7FC£§7G&–æu÷f–Wr†§6öâ’ç7V'7G"†ÖVÖ&W"ÓçfÇVRÀ¢¦VæBÒÖVÖ&W"ÓçfÇVR’Ò&WÆ6VÖVçB’°¢§6öâç&WÆ6R†ÖVÖ&W"ÓçfÇVRÂ¦VæBÒÖVÖ&W"ÓçfÇVRÂ&WÆ6VÖVçB“°¢Ğ¢&WGW&âG'VS°¢Ó°¢&WGW&â6WD6ö÷&F–æFR‚'‚"Â‚’bb6WD6ö÷&F–æFR‚'’"Â’“°§Ğ ¦WFò&VÖ÷fTæÖVD§6öäö&¦V7B‡7FC£§7G&–ærb§6öâÂ7FC£§7G&–æu÷f–WræÖR’Óâ&ööÃ° ¦WFòæW7D&F6„Æ&VÅVæFW$6†V6¶&÷‚‡7FC£§7G&–ærb§6öâ’Óâ&ööÂ°¢6öç7FW‡"7FC£§7G&–æu÷f–Wr6†V6¶&÷„æÖRĞ¢'VÇF–ÖFU÷67&W%ö&F6…÷FövvÆR#°¢6öç7FW‡"7FC£§7G&–æu÷f–WrÆ&VÄæÖRÒ'VÇF–ÖFU÷67&W%ö&F6…öÆ&VÂ#°¢6öç7BWFò6†V6¶&÷‚Òf–æDæÖVD§6öäö&¦V7B†§6öâÂ6†V6¶&÷„æÖR“°¢6öç7BWFòÆ&VÂÒf–æDæÖVD§6öäö&¦V7B†§6öâÂÆ&VÄæÖR“°¢–b‚6†V6¶&÷‚ÇÂÆ&VÂ’&WGW&âG'VS° ¢6öç7BWFò6†–ÆG&VâÒf–æD§6öä'&”ÖVÖ&W"†§6öâÂ¦6†V6¶&÷‚Â&6†–ÆG&Vâ"“°¢–b†6†–ÆG&VâbbÆ&VÂÓæ&Vv–ââ6†–ÆG&VâÓæ&Vv–à¢bbÆ&VÂÓæVæBÂ6†–ÆG&VâÓæVæB’°¢&WGW&âG'VS°¢Ğ¢–b„f–æDF—&V7D§6öäÖVÖ&W"†§6öâÂ¦6†V6¶&÷‚Â&6†–ÆG&Vâ"’bb6†–ÆG&Vâ’°¢&WGW&âfÇ6S°¢Ğ ¢6öç7BWFò6†V6¶&÷…‚Ò&VDæÖVEv–FvWE&V7D6ö÷&F–æFR†§6öâÀ¢6†V6¶&÷„æÖRÂ'‚"“°¢6öç7BWFò6†V6¶&÷…’Ò&VDæÖVEv–FvWE&V7D6ö÷&F–æFR†§6öâÀ¢6†V6¶&÷„æÖRÂ'’"“°¢6öç7BWFòÆ&VÅ‚Ò&VDæÖVEv–FvWE&V7D6ö÷&F–æFR†§6öâÂÆ&VÄæÖRÂ'‚"“°¢6öç7BWFòÆ&VÅ’Ò&VDæÖVEv–FvWE&V7D6ö÷&F–æFR†§6öâÂÆ&VÄæÖRÂ'’"“°¢–b‚6†V6¶&÷…‚ÇÂ6†V6¶&÷…’ÇÂÆ&VÅ‚ÇÂÆ&VÅ’’&WGW&âfÇ6S° ¢6öç7B7FC£¦–çCcE÷B&VÆF—fU‚Ò7FF–5ö67CÇ7FC£¦–çCcE÷Câ‚¦Æ&VÅ‚¢Ò¦6†V6¶&÷…ƒ°¢6öç7B7FC£¦–çCcE÷B&VÆF—fU’Ò7FF–5ö67CÇ7FC£¦–çCcE÷Câ‚¦Æ&VÅ’¢Ò¦6†V6¶&÷…“°¢–b‡&VÆF—fU‚Â7FC£¦çVÖW&–5öÆ–Ö—G3Ç7FC£¦–çC3%÷Cã£¦Ö–â‚¢ÇÂ&VÆF—fU‚â7FC£¦çVÖW&–5öÆ–Ö—G3Ç7FC£¦–çC3%÷Cã£¦Ö‚‚¢ÇÂ&VÆF—fU’Â7FC£¦çVÖW&–5öÆ–Ö—G3Ç7FC£¦–çC3%÷Cã£¦Ö–â‚¢ÇÂ&VÆF—fU’â7FC£¦çVÖW&–5öÆ–Ö—G3Ç7FC£¦–çC3%÷Cã£¦Ö‚‚¢ÇÂ6WDæÖVEv–FvWE&V7E÷6—F–öâ†§6öâÂÆ&VÄæÖRÀ¢7FF–5ö67CÇ7FC£¦–çC3%÷Câ‡&VÆF—fU‚’À¢7FF–5ö67CÇ7FC£¦–çC3%÷Câ‡&VÆF—fU’’’’°¢&WGW&âfÇ6S°¢Ğ ¢6öç7BWFò&VÆF—fTÆ&VÂÒf–æDæÖVD§6öäö&¦V7B†§6öâÂÆ&VÄæÖR“°¢–b‚&VÆF—fTÆ&VÂ’&WGW&âfÇ6S°¢6öç7B7FC£§7G&–ærÆ&VÄ–æFVçBÒ§6öä–æFVçFF–öäB†§6öâÀ¢&VÆF—fTÆ&VÂÓæ&Vv–â“°¢6öç7B7FC£§7G&–ær6W&–Æ—¦VDÆ&VÂ†§6öâç7V'7G"‡&VÆF—fTÆ&VÂÓæ&Vv–âÀ¢&VÆF—fTÆ&VÂÓæVæBÒ&VÆF—fTÆ&VÂÓæ&Vv–â²’“°¢–b‚&VÖ÷fTæÖVD§6öäö&¦V7B†§6öâÂÆ&VÄæÖR’’&WGW&âfÇ6S°¢6öç7BWFòWFFVD6†V6¶&÷‚Òf–æDæÖVD§6öäö&¦V7B†§6öâÂ6†V6¶&÷„æÖR“°¢&WGW&âWFFVD6†V6¶&÷‚bbVæD§6öä'&”ÖVÖ&W"†§6öâÂ§WFFVD6†V6¶&÷‚À¢&6†–ÆG&Vâ"Â6W&–Æ—¦VDÆ&VÂÂÆ&VÄ–æFVçB“°§Ğ ¦WFò6WDæÖVEv–FvWEf—6–&ÆR‡7FC£§7G&–ærb§6öâÂ7FC£§7G&–æu÷f–Wrv–FvWDæÖRÀ¢&ööÂf—6–&ÆR’Óâ&ööÂ°¢6öç7BWFòv–FvWBÒf–æDæÖVD§6öäö&¦V7B†§6öâÂv–FvWDæÖR“°¢–b‚v–FvWB’&WGW&âfÇ6S°¢6öç7BWFòf–VÆG2Òf–æD§6öäö&¦V7DÖVÖ&W"†§6öâÂ§v–FvWBÂ&f–VÆG2"“°¢–b‚f–VÆG2’&WGW&âfÇ6S°¢6öç7BWFòf—6–&–Æ—G’Òf–æDF—&V7D§6öäÖVÖ&W"†§6öâÂ¦f–VÆG2Â'f—6–&ÆR"“°¢6öç7B7FC£§7G&–ær&WÆ6VÖVçBÒf—6–&ÆRò'G'VR"¢&fÇ6R#°¢–b‡f—6–&–Æ—G’’°¢6öç7BWFòFö¶VäVæBÒ§6öå66Æ$VæB†§6öâÂf—6–&–Æ—G’ÓçfÇVRÂf–VÆG2ÓæVæB“°¢–b‚Fö¶VäVæB’&WGW&âfÇ6S°¢–b‡7FC£§7G&–æu÷f–Wr†§6öâ’ç7V'7G"‡f—6–&–Æ—G’ÓçfÇVRÀ¢§Fö¶VäVæBÒf—6–&–Æ—G’ÓçfÇVR’Ò&WÆ6VÖVçB’°¢§6öâç&WÆ6R‡f—6–&–Æ—G’ÓçfÇVRÂ§Fö¶VäVæBÒf—6–&–Æ—G’ÓçfÇVRÀ¢&WÆ6VÖVçB“°¢Ğ¢&WGW&âG'VS°¢Ğ¢–b‡f—6–&ÆR’&WGW&âG'VS° ¢6öç7BWFòf—'7DÖVÖ&W"Òf–æDF—&V7D§6öäÖVÖ&W"†§6öâÂ¦f–VÆG2Â'&V7B"“°¢–b‚f—'7DÖVÖ&W"’&WGW&âfÇ6S°¢6öç7B7FC£§6—¦U÷BÆ–æU7F'BÒ§6öâç&f–æB‚uÆârÂf—'7DÖVÖ&W"Óæ¶W’“°¢6öç7B7FC£§6—¦U÷B–æFVçFF–öå7F'BÒÆ–æU7F'BÓÒ7FC£§7G&–æs£¦ç÷0¢òf–VÆG2Óæ&Vv–â²¢Æ–æU7F'B²°¢6öç7B7FC£§7G&–ær&Vf—‚Ò§6öâç7V'7G"†–æFVçFF–öå7F'BÀ¢f—'7DÖVÖ&W"Óæ¶W’Ò–æFVçFF–öå7F'B“°¢6öç7B&ööÂÖVÖ&W%7F'G4Æ–æRÒ7FC£¦ÆÅööb‡&Vf—‚æ&Vv–â‚’Â&Vf—‚æVæB‚’À¢µÒ†6†"6†&7FW"’°¢&WGW&â6†&7FW"ÓÒrrÇÂ6†&7FW"ÓÒuÇBrÇÂ6†&7FW"ÓÒuÇ"s°¢Ò“°¢6öç7B7FC£§7G&–æræWvÆ–æRÒÆ–æU7F'BÒ7FC£§7G&–æs£¦ç÷0¢bbÆ–æU7F'Bâbb§6öå¶Æ–æU7F'BÒÒÓÒuÇ"p¢ò%Ç%Æâ"¢%Æâ#°¢7FC£§7G&–ærf—6–&–Æ—G”ÖVÖ&W"Ò%Â'f—6–&ÆUÂ#¢"²&WÆ6VÖVçB²"Â#°¢–b†ÖVÖ&W%7F'G4Æ–æR’°¢f—6–&–Æ—G”ÖVÖ&W"³ÒæWvÆ–æR²&Vf—ƒ°¢ÒVÇ6R°¢òò6öÖRW6W"Æ–÷WG2¶VWÆ&VÂw2f–VÆG2ö&¦V7BöâöæRÆ–æRâ¶VW ¢òòfÆ–B¥4ôâ'’6W&F–ærF†R–æ¦V7FVBÖVÖ&W"v—F‚76RF†W&Rà¢f—6–&–Æ—G”ÖVÖ&W"³Òrs°¢Ğ¢§6öâæ–ç6W'B†f—'7DÖVÖ&W"Óæ¶W’Âf—6–&–Æ—G”ÖVÖ&W"“°¢&WGW&âG'VS°§Ğ ¦WFò6WD&F6„6†V6¶&÷…f—6–&–Æ—G’‡7FC£§7G&–ærb§6öâÂ&ööÂf—6–&ÆR’Óâ&ööÂ°¢6öç7FW‡"7FC£¦'&“Ç7FC£§7G&–æu÷f–WrÂ#âv–FvWDæÖW7°¢'VÇF–ÖFU÷67&W%ö&F6…÷FövvÆR"À¢'VÇF–ÖFU÷67&W%ö&F6…öÆ&VÂ ¢Ó°¢f÷"†6öç7BWFòv–FvWDæÖR¢v–FvWDæÖW2’°¢òò¶VWW6W"Æ–÷WG2F†B–çFVçF–öæÆÇ’öÖ—BV—F†W"v–FvWBVçF÷V6†VBà¢–b‚f–æDæÖVD§6öäö&¦V7B†§6öâÂv–FvWDæÖR’’6öçF–çVS°¢–b‚6WDæÖVEv–FvWEf—6–&ÆR†§6öâÂv–FvWDæÖRÂf—6–&ÆR’’&WGW&âfÇ6S°¢Ğ¢&WGW&âG'VS°§Ğ ¦WFò6WDæÖVEv–FvWE7G&–ær‡7FC£§7G&–ærb§6öâÂ7FC£§7G&–æu÷f–Wrv–FvWDæÖRÀ¢7FC£§7G&–æu÷f–WrÖVÖ&W$æÖRÂ7FC£§7G&–æu÷f–WrfÇVR’Óâ&ööÂ°¢6öç7BWFòv–FvWBÒf–æDæÖVD§6öäö&¦V7B†§6öâÂv–FvWDæÖR“°¢–b‚v–FvWB’&WGW&âfÇ6S°¢6öç7BWFòf–VÆG2Òf–æD§6öäö&¦V7DÖVÖ&W"†§6öâÂ§v–FvWBÂ&f–VÆG2"“°¢–b‚f–VÆG2’&WGW&âfÇ6S°¢6öç7BWFòÖVÖ&W"Òf–æDF—&V7D§6öäÖVÖ&W"†§6öâÂ¦f–VÆG2ÂÖVÖ&W$æÖR“°¢–b‚ÖVÖ&W"’&WGW&âfÇ6S°¢7FC£§6—¦U÷BgFW%fÇVW·Ó°¢–b‚&VD§6öå7G&–ær†§6öâÂÖVÖ&W"ÓçfÇVRÂf–VÆG2ÓæVæBÂgFW%fÇVR’’°¢&WGW&âfÇ6S°¢Ğ¢6öç7B7FC£§7G&–ær&WÆ6VÖVçBÒ%Â""²7FC£§7G&–ær‡fÇVR’²%Â"#°¢–b‡7FC£§7G&–æu÷f–Wr†§6öâ’ç7V'7G"†ÖVÖ&W"ÓçfÇVRÀ¢gFW%fÇVRÒÖVÖ&W"ÓçfÇVR’Ò&WÆ6VÖVçB’°¢§6öâç&WÆ6R†ÖVÖ&W"ÓçfÇVRÂgFW%fÇVRÒÖVÖ&W"ÓçfÇVRÂ&WÆ6VÖVçB“°¢Ğ¢&WGW&âG'VS°§Ğ ¦WFò&VÖ÷fTæÖVD§6öäö&¦V7B‡7FC£§7G&–ærb§6öâÂ7FC£§7G&–æu÷f–WræÖR’Óâ&ööÂ°¢6öç7BWFòö&¦V7BÒf–æDæÖVD§6öäö&¦V7B†§6öâÂæÖR“°¢–b‚ö&¦V7B’&WGW&âG'VS° ¢7FC£§6—¦U÷BgFW$ö&¦V7BÒö&¦V7BÓæVæB²°¢6¶—§6öåv†—FW76R†§6öâÂgFW$ö&¦V7BÂ§6öâç6—¦R‚’“°¢–b†gFW$ö&¦V7BÂ§6öâç6—¦R‚’bb§6öå¶gFW$ö&¦V7EÒÓÒrÂr’°¢§6öâæW&6R†ö&¦V7BÓæ&Vv–âÂgFW$ö&¦V7BÒö&¦V7BÓæ&Vv–â²“°¢ÒVÇ6R°¢7FC£§6—¦U÷B&Vf÷&Tö&¦V7BÒö&¦V7BÓæ&Vv–ã°¢v†–ÆR†&Vf÷&Tö&¦V7Bâbb†§6öå¶&Vf÷&Tö&¦V7BÒÒÓÒrp¢ÇÂ§6öå¶&Vf÷&Tö&¦V7BÒÒÓÒuÇBp¢ÇÂ§6öå¶&Vf÷&Tö&¦V7BÒÒÓÒuÇ"p¢ÇÂ§6öå¶&Vf÷&Tö&¦V7BÒÒÓÒuÆâr’’°¢ÒÖ&Vf÷&Tö&¦V7C°¢Ğ¢–b†&Vf÷&Tö&¦V7Bâbb§6öå¶&Vf÷&Tö&¦V7BÒÒÓÒrÂr’°¢6öç7B7FC£§6—¦U÷BW&6T&Vv–âÒ&Vf÷&Tö&¦V7BÒ°¢§6öâæW&6R†W&6T&Vv–âÂö&¦V7BÓæVæB²ÒW&6T&Vv–â“°¢ÒVÇ6R°¢§6öâæW&6R†ö&¦V7BÓæ&Vv–âÂö&¦V7BÓæVæB²Òö&¦V7BÓæ&Vv–â“°¢Ğ¢Ğ¢&WGW&âf–æDæÖVD§6öäö&¦V7B†§6öâÂæÖR’æ†5÷fÇVR‚“°§Ğ ¦WFò–æ¦V7E6W&FT'WGFöâ‡7FC£§7G&–ærb§6öâÂ&ööÂ7V&TÆ–÷WB’Óâ&ööÂ°¢–b„f–æDæÖVD§6öäö&¦V7B†§6öâÂ'VÇF–ÖFU÷67&W%÷G&ç6×WFR"’’&WGW&âG'VS° ¢6öç7FW‡"7FC£§7G&–æu÷f–Wr7V&T'WGFöâÒ"&§6öâ‡°¢'G—R#¢$'WGFöåv–FvWB"Â&æÖR#¢'VÇF–ÖFU÷67&W%÷G&ç6×WFR"À¢&f–VÆG2#¢°¢'&V7B#¢²'‚#¢cCÂ'’#¢“sRÒÀ¢&f–ÆVæÖR#¢%äTÅÅÅfVæF÷'5ÅÅ&W—$ÆÅô'WGFöâ"À¢'FööÇF—7G&–ær#¢%6ÇfvR"À¢&†÷fW&VDg&ÖR#¢"À¢'6÷VæB#¢&7W'6÷%ö6öçfW'Eö—FVÒ"À¢&öä6Æ–6´ÖW76vR#¢$†÷&G&–47V&UæVÄÖW76vS¤6öçfW'C¥VÇF–ÖFU67&W" ¢Ğ§Ò–§6öâ#°¢6öç7FW‡"7FC£§7G&–æu÷f–Wr7F6„'WGFöâÒ"&§6öâ‡°¢'G—R#¢$'WGFöåv–FvWB"Â&æÖR#¢'VÇF–ÖFU÷67&W%÷G&ç6×WFR"À¢&f–VÆG2#¢°¢'&V7B#¢²'‚#¢ƒÂ'’#¢CÒÀ¢&f–ÆVæÖR#¢%äTÅÅÅfVæF÷'5ÅÅ&W—$ÆÅô'WGFöâ"À¢'FööÇF—7G&–ær#¢%6ÇfvR"À¢&†÷fW&VDg&ÖR#¢"À¢'6÷VæB#¢&7W'6÷%ö6öçfW'Eö—FVÒ"À¢&öä6Æ–6´ÖW76vR#¢$&æµæVÄÖW76vS¤6öçfW'C¥VÇF–ÖFU67&W" ¢Ğ§Ò–§6öâ#°¢6öç7BWFò6öçfW'D'WGFöâÒf–æD6öçfW'D'WGFöâ†§6öâÀ¢7V&TÆ–÷WBò$†÷&G&–47V&UæVÄÖW76vS¤6öçfW'B ¢¢$&æµæVÄÖW76vS¤6öçfW'B"“°¢–b‚6öçfW'D'WGFöâ’&WGW&âfÇ6S°¢&WGW&â–ç6W'D§6öä'&”ö&¦V7DgFW"†§6öâÂ¦6öçfW'D'WGFöâÀ¢7V&TÆ–÷WBò7V&T'WGFöâ¢7F6„'WGFöâ“°§Ğ ¦WFò7–æ4W†—7F–æt&F6„6†V6¶&÷‚‡7FC£§7G&–ærb§6öâÂ&ööÂ7V&TÆ–÷WB’Óâ&ööÂ°¢–b‚f–æDæÖVD§6öäö&¦V7B†§6öâÂ'VÇF–ÖFU÷67&W%ö&F6…÷FövvÆR"’’°¢&WGW&âG'VS°¢Ğ¢òò6öçfW'B—2æF—fRÂ&Vv—7FW&VBT’ÖW76vRâÖFR×W6öÖÖæBæÖP¢òò6W6W2C%$ÆöFW"w2ÖW76vR'6W"Fò76W'B&Vf÷&RÆ—7FVæW'2'Vâà¢6öç7B7FC£§7G&–ærF&vWBÒ7V&TÆ–÷W@¢ò$†÷&G&–47V&UæVÄÖW76vR"¢$&æµæVÄÖW76vR#°¢&WGW&â6WDæÖVEv–FvWE7G&–ær†§6öâÂ'VÇF–ÖFU÷67&W%ö&F6…÷FövvÆR"À¢&öä6Æ–6´ÖW76vR"À¢F&vWB²#¤6öçfW'C¥VÇF–ÖFU67&W$&F6‚"¢bbæW7D&F6„Æ&VÅVæFW$6†V6¶&÷‚†§6öâ“°§Ğ ¦WFò–æ¦V7D&F6„6†V6¶&÷‚‡7FC£§7G&–ærb§6öâÂ&ööÂ7V&TÆ–÷WBÀ¢&ööÂæF—fT'WGFöäÖöFR’Óâ&ööÂ°¢6öç7FW‡"7FC£§7G&–æu÷f–Wr&F6„6†V6¶&÷‚Ò"&§6öâ‡°¢'G—R#¢%FövvÆT'WGFöåv–FvWB"Â&æÖR#¢'VÇF–ÖFU÷67&W%ö&F6…÷FövvÆR"À¢&f–VÆG2#¢°¢'&V7B#¢²'‚#¢SCRÂ'’#¢ƒ‚Â'v–GF‚#¢cBÂ&†V–v‡B#¢cBÒÀ¢'6÷VæB#¢&7W'6÷%öÖVçU÷6VÆV7Eö†B"À¢&f–ÆVæÖR#¢$Æö&'•ÅÄ7&VFTvÖUÅÄ7&VFTvÖUôGfæ6VD6†V6¶&÷‚"À¢'VçFövvÆVDg&ÖR#¢À¢'VçFövvÆVE&W76VDg&ÖR#¢À¢'VçFövvÆVD†÷fW&VDg&ÖR#¢2À¢'VçFövvÆVDF—6&ÆVDg&ÖR#¢"À¢'FövvÆVDg&ÖR#¢BÀ¢'FövvÆVE&W76VDg&ÖR#¢RÀ¢'FövvÆVD†÷fW&VDg&ÖR#¢bÀ¢'FööÇF—7G&–ær#¢%&ö6W72V6‚ÖF6†–ær–çWB—FVÒ6W&FVÇ’"À¢&öä6Æ–6´ÖW76vR#¢$†÷&G&–47V&UæVÄÖW76vS¤6öçfW'C¥VÇF–ÖFU67&W$&F6‚ ¢Ğ§Ò–§6öâ#°¢6öç7FW‡"7FC£§7G&–æu÷f–Wr&F6„Æ&VÂÒ"&§6öâ‡²'G—R#¢%FW‡D&÷…v–FvWB"Â&æÖR#¢'VÇF–ÖFU÷67&W%ö&F6…öÆ&VÂ"À ’&f–VÆG2#§° ’'f—6–&ÆR#¢G'VRÂ'&V7B#§²'‚#¢ÓSRÂ'’#£C"Â'v–GF‚#£ƒÂ&†V–v‡B#£cGÒÀ ’'FW‡B#¢$&F6‚67&"À ’'7G–ÆR#§²&föçD6öÆ÷"#¢"EæVÅF—FÆT6öÆ÷""À ’'ö–çE6—¦R#¢"E6ÖÆÅæVÄföçE6—¦R"À ’&Æ–væÖVçB#§²'b#¢&6VçFW""Â&‚#¢&ÆVgB'ÒÀ ’&G&÷6†F÷r#¢"DFVfVÇDG&÷6†F÷r'××Ğ¢–§6öâ#° ¢WFò6†V6¶&÷‚Òf–æDæÖVD§6öäö&¦V7B†§6öâÀ¢'VÇF–ÖFU÷67&W%ö&F6…÷FövvÆR"“°¢–b‚6†V6¶&÷‚’°¢6öç7BWFòW†—7F–æt'WGFöâÒf–æDæÖVD§6öäö&¦V7B†§6öâÀ¢'VÇF–ÖFU÷67&W%÷G&ç6×WFR"“°¢6öç7B7FC£§7G&–ær6öçfW'DÖW76vRÒ7V&TÆ–÷W@¢ò$†÷&G&–47V&UæVÄÖW76vS¤6öçfW'B ¢¢$&æµæVÄÖW76vS¤6öçfW'B#°¢6öç7BWFòæ6†÷"ÒW†—7F–æt'WGFöà¢òW†—7F–æt'WGFöâ¢f–æD6öçfW'D'WGFöâ†§6öâÂ6öçfW'DÖW76vR“°¢–b‚æ6†÷"ÇÂ–ç6W'D§6öä'&”ö&¦V7DgFW"†§6öâÂ¦æ6†÷"À¢&F6„6†V6¶&÷‚’’°¢&WGW&âfÇ6S°¢Ğ¢6†V6¶&÷‚Òf–æDæÖVD§6öäö&¦V7B†§6öâÀ¢'VÇF–ÖFU÷67&W%ö&F6…÷FövvÆR"“°¢–b‚6†V6¶&÷‚’&WGW&âfÇ6S°¢6öç7B7FC£¦–çC3%÷BFVfVÇE‚Ò7V&TÆ–÷W@¢òæF—fT'WGFöäÖöFRòSCR¢cc2¢ƒ#S°¢6öç7B7FC£¦–çC3%÷BFVfVÇE’Ò7V&TÆ–÷WBòƒ€¢¢æF—fT'WGFöäÖöFRòC"¢S3°¢–b‚6WDæÖVEv–FvWE&V7E÷6—F–öâ†§6öâÀ¢'VÇF–ÖFU÷67&W%ö&F6…÷FövvÆR"ÂFVfVÇE‚ÂFVfVÇE’’’°¢&WGW&âfÇ6S°¢Ğ¢Ğ¢–b‚f–æDæÖVD§6öäö&¦V7B†§6öâÂ'VÇF–ÖFU÷67&W%ö&F6…öÆ&VÂ"’’°¢–b‚VæD§6öä'&”ÖVÖ&W"†§6öâÂ¦6†V6¶&÷‚Â&6†–ÆG&Vâ"Â&F6„Æ&VÂ’’°¢&WGW&âfÇ6S°¢Ğ¢Ğ¢&WGW&â7–æ4W†—7F–æt&F6„6†V6¶&÷‚†§6öâÂ7V&TÆ–÷WB“°§Ğ ¦WFòf–æD7F—fTÆ–÷WDf–ÆR†6öç7Bv6†%÷B¢f–ÆTæÖR’Óâ7FC£¦f–ÆW7—7FVÓ£§F‚°¢–b„6öçFW‡BÓÒçVÆÇG"ÇÂ6öçFW‡BÓæÖöDF—&V7F÷'’ÓÒçVÆÇG ¢ÇÂ6öçFW‡BÓæÖöDF—&V7F÷'•³ÒÓÒÂuÃr’°¢&WGW&â·Ó°¢Ğ¢7FC£§fV7F÷#Ç7FC£¦f–ÆW7—7FVÓ£§Fƒâ&ö÷G7°¢7FC£¦f–ÆW7—7FVÓ£§F‚„6öçFW‡BÓæÖöDF—&V7F÷'’—Ó°¢6öç7BWFò6öæf–uF‚Ò6öæf–uF‚‚“°¢–b‚6öæf–uF‚æV×G’‚’’°¢6öç7BWFòÖöE&ö÷BÒ6öæf–uF‚ç&VçE÷F‚‚’ç&VçE÷F‚‚’ç&VçE÷F‚‚“°¢–b‡7FC£¦f–æB‡&ö÷G2æ&Vv–â‚’Â&ö÷G2æVæB‚’ÂÖöE&ö÷B’ÓÒ&ö÷G2æVæB‚’’°¢&ö÷G2çW6…ö&6²†ÖöE&ö÷B“°¢Ğ¢Ğ ¢7FC£¦f–ÆW7—7FVÓ£§F‚ÖöDföÆFW#°¢–b„6öçFW‡BÓæ7F—fTÖöBÒçVÆÇG"bb6öçFW‡BÓæ7F—fTÖöE³ÒÒuÃr’°¢7FC£§7G&–ærÖöDæÖR„6öçFW‡BÓæ7F—fTÖöB“°¢–b†ÖöDæÖRæf–æEöf—'7Eööb‚"õÅÃ¢"’Ò7FC£§7G&–æs£¦ç÷2’°¢ÖöDæÖRæ6ÆV"‚“°¢Ğ¢–b‚ÖöDæÖRæV×G’‚¢bb†ÖöDæÖRç6—¦R‚’Â@¢ÇÂÖöDæÖRç7V'7G"†ÖöDæÖRç6—¦R‚’ÒB’Ò"æ×"’’°¢ÖöDæÖR³Ò"æ×#°¢Ğ¢–b‚ÖöDæÖRæV×G’‚’’°¢7FC£§S‡7G&–ærÖöDæÖUWFcƒ°¢ÖöDæÖUWFc‚ç&W6W'fR†ÖöDæÖRç6—¦R‚’“°¢f÷"†6öç7BVç6–væVB6†"6†&7FW"¢ÖöDæÖR’°¢ÖöDæÖUWFc‚çW6…ö&6²‡7FF–5ö67CÆ6†#…÷Câ†6†&7FW"’“°¢Ğ¢ÖöDföÆFW"Ò7FC£¦f–ÆW7—7FVÓ£§F‚†ÖöDæÖUWFc‚“°¢Ğ¢Ğ ¢f÷"†6öç7BWFòb&ö÷B¢&ö÷G2’°¢7FC£§fV7F÷#Ç7FC£¦f–ÆW7—7FVÓ£§Fƒâ6æF–FFW3°¢–b‚ÖöDföÆFW"æV×G’‚’’°¢6æF–FFW2çW6…ö&6²‡&ö÷BòÖöDföÆFW"òÂ&FF"òÂ&vÆö&Â ¢òÂ'V’"òÂ&Æ–÷WG2"òf–ÆTæÖR“°¢Ğ¢6æF–FFW2çW6…ö&6²‡&ö÷BòÂ&FF"òÂ&vÆö&Â"òÂ'V’ ¢òÂ&Æ–÷WG2"òf–ÆTæÖR“°¢f÷"†6öç7BWFòb6æF–FFR¢6æF–FFW2’°¢7FC£¦W'&÷%ö6öFRW'&÷#°¢–b‡7FC£¦f–ÆW7—7FVÓ£¦—5÷&VwVÆ%öf–ÆR†6æF–FFRÂW'&÷"’bbW'&÷"’°¢&WGW&â6æF–FFS°¢Ğ¢Ğ¢Ğ¢&WGW&â·Ó°§Ğ ¦WFò&VEFW‡Df–ÆR†6öç7B7FC£¦f–ÆW7—7FVÓ£§F‚bF‚¢Óâ7FC£¦÷F–öæÃÇ7FC£§7G&–æsâ°¢G'’°¢7FC£¦–g7G&VÒ–çWB‡F‚Â7FC£¦–÷3£¦&–æ'’“°¢–b‚–çWBæ—5ö÷Vâ‚’’&WGW&â7FC£¦çVÆÆ÷C°¢7FC£§7G&–ær6öçFVçG2‡7FC£¦—7G&VÖ'Veö—FW&F÷#Æ6†#â†–çWB’Â·Ò“°¢–b†–çWBæ&B‚’’&WGW&â7FC£¦çVÆÆ÷C°¢&WGW&â6öçFVçG3°¢Ò6F6‚‚âââ’°¢&WGW&â7FC£¦çVÆÆ÷C°¢Ğ§Ğ ¦WFò7F÷&UFW‡DFöÖ–6ÆÇ’†6öç7B7FC£¦f–ÆW7—7FVÓ£§F‚bF‚À¢6öç7B7FC£§7G&–ærb6öçFVçG2’æöW†6WBÓâ&ööÂ°¢G'’°¢7FC£¦W'&÷%ö6öFRW'&÷#°¢7FC£¦f–ÆW7—7FVÓ£¦7&VFUöF—&V7F÷&–W2‡F‚ç&VçE÷F‚‚’ÂW'&÷"“°¢–b†W'&÷"’&WGW&âfÇ6S°¢7FC£¦f–ÆW7—7FVÓ£§F‚FV×÷&'•F‚ÒFƒ°¢FV×÷&'•F‚³ÒÂ"çVÇF–ÖFR×67&W"çF×#°¢W'&÷"æ6ÆV"‚“°¢‡fö–B—7FC£¦f–ÆW7—7FVÓ£§&VÖ÷fR‡FV×÷&'•F‚ÂW'&÷"“°¢7FC£¦ög7G&VÒ÷WGWB‡FV×÷&'•F‚Â7FC£¦–÷3£¦&–æ'’Â7FC£¦–÷3£§G'Væ2“°¢–b‚÷WGWBæ—5ö÷Vâ‚’’&WGW&âfÇ6S°¢÷WGWBçw&—FR†6öçFVçG2æFF‚’À¢7FF–5ö67CÇ7FC£§7G&V×6—¦Sâ†6öçFVçG2ç6—¦R‚’’“°¢÷WGWBæ6Æ÷6R‚“°¢–b‚÷WGWB’°¢7FC£¦f–ÆW7—7FVÓ£§&VÖ÷fR‡FV×÷&'•F‚ÂW'&÷"“°¢&WGW&âfÇ6S°¢Ğ¢–b‚Ö÷fTf–ÆTW…r‡FV×÷&'•F‚æ5÷7G"‚’ÂF‚æ5÷7G"‚’À¢ÔõdTd”ÄUõ$UÄ4UôU„•5D”ärÂÔõdTd”ÄUõu$•DUõD…$õTt‚’’°¢7FC£¦f–ÆW7—7FVÓ£§&VÖ÷fR‡FV×÷&'•F‚ÂW'&÷"“°¢&WGW&âfÇ6S°¢Ğ¢&WGW&âG'VS°¢Ò6F6‚‚âââ’°¢&WGW&âfÇ6S°¢Ğ§Ğ ¦WFòVç7W&T÷&–v–æÄÆ–÷WD&6·W†6öç7B7FC£¦f–ÆW7—7FVÓ£§F‚bF‚’æöW†6W@¢Óâ&ööÂ°¢G'’°¢7FC£¦f–ÆW7—7FVÓ£§F‚&6·WF‚ÒFƒ°¢&6·WF‚³ÒÂ"çVÇF–ÖFR×67&W"æ&²#°¢7FC£¦W'&÷%ö6öFRW'&÷#°¢–b‡7FC£¦f–ÆW7—7FVÓ£¦W†—7G2†&6·WF‚ÂW'&÷"’’&WGW&âW'&÷#°¢W'&÷"æ6ÆV"‚“°¢7FC£¦f–ÆW7—7FVÓ£¦6÷•öf–ÆR‡F‚Â&6·WF‚À¢7FC£¦f–ÆW7—7FVÓ£¦6÷•ö÷F–öç3£¦æöæRÂW'&÷"“°¢&WGW&âW'&÷#°¢Ò6F6‚‚âââ’°¢&WGW&âfÇ6S°¢Ğ§Ğ §7G'V7BÆ–÷WEf&–çEF‡2°¢7FC£¦f–ÆW7—7FVÓ£§F‚æF—fS°¢7FC£¦f–ÆW7—7FVÓ£§F‚6W&FS°§Ó° ¦WFòvWDÆ–÷WEf&–çEF‡2†6öç7B7FC£¦f–ÆW7—7FVÓ£§F‚bÆ–÷WEF‚¢ÓâÆ–÷WEf&–çEF‡2°¢6öç7BWFò6öæf–uF‚Ò6öæf–uF‚‚“°¢–b†6öæf–uF‚æV×G’‚’ÇÂ6öæf–uF‚ç&VçE÷F‚‚’æV×G’‚’’&WGW&â·Ó°¢6öç7BWFòf&–çDF—&V7F÷'’Ò6öæf–uF‚ç&VçE÷F‚‚¢òÂ'VÇF–ÖFR×67&W"ÖÆ–÷WG2#°¢6öç7BWFò&6TæÖRÒÆ–÷WEF‚ç7FVÒ‚’çw7G&–ær‚“°¢6öç7BWFòW‡FVç6–öâÒÆ–÷WEF‚æW‡FVç6–öâ‚’çw7G&–ær‚“°¢&WGW&â°¢f&–çDF—&V7F÷'’ò†&6TæÖR²Â"ææF—fR"²W‡FVç6–öâ’À¢f&–çDF—&V7F÷'’ò†&6TæÖR²Â"ç6W&FR"²W‡FVç6–öâ’À¢Ó°§Ğ ¦WFò†4ç”Æ–÷WEf&–çD§6öâ†6öç7B7FC£¦f–ÆW7—7FVÓ£§F‚bÆ–÷WEF‚’æöW†6W@¢Óâ&ööÂ°¢G'’°¢6öç7BWFòf&–çEF‡2ÒvWDÆ–÷WEf&–çEF‡2†Æ–÷WEF‚“°¢–b‡f&–çEF‡2ææF—fRæV×G’‚’’&WGW&âG'VS°¢7FC£¦W'&÷%ö6öFRW'&÷#°¢–b‚7FC£¦f–ÆW7—7FVÓ£¦W†—7G2‡f&–çEF‡2ææF—fRç&VçE÷F‚‚’ÂW'&÷"’’°¢&WGW&â7FF–5ö67CÆ&ööÃâ†W'&÷"“°¢Ğ¢–b†W'&÷"’&WGW&âG'VS°¢7FC£¦f–ÆW7—7FVÓ£¦F—&V7F÷'•ö—FW&F÷"VçG'’€¢f&–çEF‡2ææF—fRç&VçE÷F‚‚’ÂW'&÷"“°¢–b†W'&÷"’&WGW&âG'VS°¢6öç7B7FC£¦f–ÆW7—7FVÓ£¦F—&V7F÷'•ö—FW&F÷"VæC°¢f÷"ƒ²VçG'’ÒVæC²VçG'’æ–æ7&VÖVçB†W'&÷"’’°¢–b†W'&÷"’&WGW&âG'VS°¢–b†VçG'’Óæ—5÷&VwVÆ%öf–ÆR†W'&÷"¢bbVçG'’ÓçF‚‚’æW‡FVç6–öâ‚’ÓÒÂ"æ§6öâ"’°¢&WGW&âG'VS°¢Ğ¢–b†W'&÷"’&WGW&âG'VS°¢Ğ¢&WGW&â7FF–5ö67CÆ&ööÃâ†W'&÷"“°¢Ò6F6‚‚âââ’°¢&WGW&âG'VS°¢Ğ§Ğ ¦WFòæ÷&ÖÆ—¦TÆ–÷WEf&–çB‡7FC£§7G&–ærb§6öâÂ&ööÂæF—fT'WGFöäÖöFRÀ¢&ööÂ7V&^{×«h‘éì¶»§q«^v\İ
+ÛÛœİÛ[˜\œ˜^Iˆ[œ]\œ˜^Kˆ[œ][S\İ	ˆ\İ[˜][ÛŠHOˆ›ÛÛÂˆYˆ
+[œ]\œ˜^K™[\J
+H[œ]\œ˜^KœÚ^™J
+HˆX^[][PİX™R][\ÊHÂˆ™]\›ˆ˜[ÙNÂˆBˆ\İ[˜][Û‹š][PÛİ[H[œ]\œ˜^KœÚ^™J
+NÂˆ›Üˆ
+İœÚ^™Wİ[™^HÈ[™^\İ[˜][Û‹š][PÛİ[È
+ÊÚ[™^
+HÂˆÛÛœİ]]È[œ]^H[œ]\œ˜^VÚ[™^K˜[YOİœİš[™ÏŠ
+NÂˆYˆ
+Z[œ]^
+H™]\›ˆ˜[ÙNÂ‚ˆÛÛœİİœİš[™×İšY]È^Hš[R[œ]^
+
+š[œ]^
+NÂˆÛÛœİİœÚ^™WİÛÛ[XHH^™š[™
+	Ë	ÊNÂˆÛÛœİİœİš[™×İšY]ÈÛÙHHš[R[œ]^
+^œİXœİŠÛÛ[XJJNÂˆ[œ][Iˆ[HH\İ[˜][Û‹š][\ÖÚ[™^NÂˆYˆ
+ÛÙHOH˜[HŠHÂˆ[K˜[PÛÙHHYNÂˆH[ÙHYˆ
+ÛÙKœİ\×İÚ]
+\NˆŠJHÂˆ\T[T™\]Y\İYHYNÂˆÛÛœİİœİš[™×İšY]È\PÛÙHHš[R[œ]^
+ÛÙKœİXœİŠJJNÂˆYˆ
+T\œÙR][U\PÛÙJ\PÛÙK[Kš][U\PÛÙJBˆR][U\Q]K˜]˜Z[X›BˆR][U\Q]KšÛ›İÛ•\PÛÙ\Ë˜ÛÛZ[œÊ[Kš][U\PÛÙJJHÂˆ™]\›ˆ˜[ÙNÂˆBˆ[K›X]Ú\Ò][U\HHYNÂˆH[ÙHYˆ
+T\œÙR][PÛÙJÛÙK\İ[˜][Û‹š][\ÖÚ[™^K˜ÛÙJJHÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆYˆ
+ÛÛ[XHOHİœİš[™×İšY]Î›œÜÊHÂˆYˆ
+^™š[™
+	Ë	ËÛÛ[XH
+ÈJHOHİœİš[™×İšY]Î›œÜÊH™]\›ˆ˜[ÙNÂˆÛÛœİİœİš[™×İšY]È]X[]U^Hš[R[œ]^
+^œİXœİŠÛÛ[XH
+ÈJJNÂˆYˆ
+T\œÙR][T]X[]J]X[]U^[Kœ]X[]JJHÂˆ™]\›ˆ˜[ÙNÂˆBˆ[Kš\Ô]X[]HHYNÂˆBˆBˆ™]\›ˆYNÂŸB‚˜]]È\œÙR[œ][\ÊÛÛœİÛ[X›IˆÙXİ[Û‹ˆ[œ]Ù][™ÜÉˆ\İ[˜][ÛŠHOˆ›ÛÛÂˆ\İ[˜][ÛˆH[œ]Ù][™ÜŞßNÂˆÛÛœİ]]Êˆ[œ]›ÙHHÙXİ[Û‹™Ù]
+š[œ]ŠNÂˆÛÛœİ]]Êˆ[œ]H[œ]›ÙHOH[ˆÈ[ˆˆ[œ]›ÙKO˜\×İX›J
+NÂˆYˆ
+[œ]OH[ŠH™]\›ˆ˜[ÙNÂ‚ˆÛÛœİ]]Êˆ[œ]Ó›ÙHH[œ]O™Ù]
+š[œ]ÈŠNÂˆYˆ
+[œ]Ó›ÙHOH[ŠH™]\›ˆ˜[ÙNÂˆ\İ[˜][Û‹\Ú[™ÑY˜][[\ÈH˜[ÙNÂˆ\İ[˜][Û‹˜[YH˜[ÙNÂ‚ˆÛÛœİ]]Êˆ[œ]ÈH[œ]Ó›ÙKO˜\×Ø\œ˜^J
+NÂˆYˆ
+[œ]ÈOH[ˆ[œ]ËOœÚ^™J
+HˆX^[][R[œ]\İÊHÂˆ™]\›ˆ˜[ÙNÂˆBˆÛÛœİ›ÛÛ\Ó™\İY\İÈHZ[œ]ËO™[\J
+Bˆ	‰ˆ
+
+š[œ]ÊVÌK˜\×Ø\œ˜^J
+HOH[Â‚ˆËÈHÚ[™ÛH[\Hİš[™È\ÈHÓSÙ[[™[›ÜˆHY˜][Û™BˆËÈ[š\]YKÔÙ][œ]™XÚ\Kˆİ\ˆ[\HÜˆX[›Ü›YY[šY\Èİ^H[˜[Y‚ˆYˆ
+Z\Ó™\İY\İÈ	‰ˆ[œ]ËOœÚ^™J
+HOHJHÂˆÛÛœİ]]ÈXÙZÛ\ˆH
+
+š[œ]ÊVÌK˜[YOİœİš[™ÏŠ
+NÂˆYˆ
+XÙZÛ\ˆ	‰ˆš[R[œ]^
+
+œXÙZÛ\ŠK™[\J
+JHÂˆ\İ[˜][ÛˆH[œ]Ù][™ÜŞßNÂˆ™]\›ˆYNÂˆBˆB‚ˆ[œ]Ù][™ÜÈ\œÙYÂˆ\œÙY\Ú[™ÑY˜][[\ÈH˜[ÙNÂˆ\œÙY˜[YHYNÂˆYˆ
+\Ó™\İY\İÊHÂˆ\œÙY›\İÛİ[H[œ]ËOœÚ^™J
+NÂˆ›Üˆ
+İœÚ^™Wİ\İ[™^HÈ\İ[™^\œÙY›\İÛİ[È
+ÊÛ\İ[™^
+HÂˆÛÛœİ]]Êˆ[œ]\œ˜^HH
+
+š[œ]ÊVÛ\İ[™^K˜\×Ø\œ˜^J
+NÂˆYˆ
+[œ]\œ˜^HOH[‚ˆT\œÙR[œ][S\İ
+
+š[œ]\œ˜^K\œÙY›\İÖÛ\İ[™^JJHÂˆ™]\›ˆ˜[ÙNÂˆBˆBˆH[ÙHÂˆ\œÙY›\İÛİ[HNÂˆYˆ
+T\œÙR[œ][S\İ
+
+š[œ]Ë\œÙY›\İÖÌJJHÂˆ™]\›ˆ˜[ÙNÂˆBˆB‚ˆ\İ[˜][ÛˆH\œÙYÂˆ™]\›ˆYNÂŸB‚˜]]Èš[UX›QšY[
+İœİš[™×İšY]ÈšY[
+H›Ù^Ù\Oˆİœİš[™×İšY]ÈÂˆÚ[H
+YšY[™[\J
+Bˆ	‰ˆ
+šY[™œ›Û
+
+HOH	È	ÈšY[™œ›Û
+
+HOH	×	ÂˆšY[™œ›Û
+
+HOH	×‰ÈšY[™œ›Û
+
+HOH	×‰ÊJHÂˆšY[œ™[[İ™WÜ™Yš^
+JNÂˆBˆÚ[H
+YšY[™[\J
+Bˆ	‰ˆ
+šY[˜˜XÚÊ
+HOH	È	ÈšY[˜˜XÚÊ
+HOH	×	ÂˆšY[˜˜XÚÊ
+HOH	×‰ÈšY[˜˜XÚÊ
+HOH	×‰ÊJHÂˆšY[œ™[[İ™WÜİY™š^
+JNÂˆBˆ™]\›ˆšY[ÂŸB‚˜]]ÈÜ]X›T›İÊİœİš[™×İšY]È[™JBˆOˆİ™XİÜİœİš[™×İšY]ÏˆÂˆİ™XİÜİœİš[™×İšY]ÏˆšY[ÎÂˆİœÚ^™Wİİ\ßNÂˆ›Üˆ
+ÎÊHÂˆÛÛœİİœÚ^™WİXˆH[™K™š[™
+	×	Ëİ\
+NÂˆYˆ
+XˆOHİœİš[™×İšY]Î›œÜÊHÂˆšY[Ëœ\ÚØ˜XÚÊš[UX›QšY[
+[™KœİXœİŠİ\
+JJNÂˆœ™XZÎÂˆBˆšY[Ëœ\ÚØ˜XÚÊš[UX›QšY[
+[™KœİXœİŠİ\XˆHİ\
+JJNÂˆİ\HXˆ
+ÈNÂˆBˆ™]\›ˆšY[ÎÂŸB‚˜]]È™XYX›RXY\œÊİšYœİ™X[Iˆ[œ]ˆİ™XİÜİœİš[™Ï‰ˆXY\œÊHOˆ›ÛÛÂˆİœİš[™È[™NÂˆYˆ
+\İ™Ù][™J[œ][™JJH™]\›ˆ˜[ÙNÂˆİœİš[™×İšY]ÈXY\“[™J[™JNÂˆYˆ
+XY\“[™Kœİ\×İÚ]
+—Q——‘ˆŠJHXY\“[™Kœ™[[İ™WÜ™Yš^
+ÊNÂˆÛÛœİ]]ÈšY[ÈHÜ]X›T›İÊXY\“[™JNÂˆXY\œËœ™\Ù\™JšY[ËœÚ^™J
+JNÂˆ›Üˆ
+İœİš[™×İšY]ÈšY[ˆšY[ÊHÂˆİœİš[™È˜[YJšY[
+NÂˆ›Üˆ
+Ú\‰ˆÚ\˜Xİ\ˆˆ˜[YJHÂˆYˆ
+Ú\˜Xİ\ˆH	ĞIÈ	‰ˆÚ\˜Xİ\ˆH	Ö‰ÊHÂˆÚ\˜Xİ\ˆHİ]X×ØØ\İÚ\ŠÚ\˜Xİ\ˆH	ĞIÈ
+È	ØIÊNÂˆBˆBˆXY\œËœ\ÚØ˜XÚÊİ›[İ™J˜[YJJNÂˆBˆ™]\›ˆZXY\œË™[\J
+NÂŸB‚˜]]Èš[™X›PÛÛ[[ŠÛÛœİİ™XİÜİœİš[™Ï‰ˆXY\œËˆİœİš[™×İšY]È˜[YJHOˆİ›Ü[Û˜[İœÚ^™WİˆÂˆ›Üˆ
+İœÚ^™Wİ[™^HÈ[™^XY\œËœÚ^™J
+NÈ
+ÊÚ[™^
+HÂˆYˆ
+XY\œÖÚ[™^HOH˜[YJH™]\›ˆ[™^ÂˆBˆ™]\›ˆİ›[ÜÂŸB‚˜]]ÈX›QšY[]
+ÛÛœİİ™XİÜİœİš[™×İšY]Ï‰ˆšY[ËˆİœÚ^™Wİ[™^
+H›Ù^Ù\Oˆİœİš[™×İšY]ÈÂˆ™]\›ˆ[™^šY[ËœÚ^™J
+HÈšY[ÖÚ[™^Hˆİœİš[™×İšY]ŞßNÂŸB‚˜]]È\Ñ[˜X›YX›Q›YÊİœİš[™×İšY]È˜[YJH›Ù^Ù\Oˆ›ÛÛÂˆ™]\›ˆ˜[YHOHŒHˆ˜[YHOHYHˆ˜[YHOHY\ÈÂŸB‚˜]]È\Ô]Y\İX›U˜[YJİœİš[™×İšY]È˜[YJH›Ù^Ù\Oˆ›ÛÛÂˆYˆ
+˜[YK™[\J
+JH™]\›ˆ˜[ÙNÂˆİš[Ì—İ]Y\İYßNÂˆÛÛœİ]]È\œÙYHİ™œ›ÛWØÚ\œÊ˜[YK™]J
+Kˆ˜[YK™]J
+H
+È˜[YKœÚ^™J
+K]Y\İY
+NÂˆ™]\›ˆ\œÙY™XÈOHİ™\œ˜ŞßBˆ	‰ˆ\œÙYœˆOH˜[YK™]J
+H
+È˜[YKœÚ^™J
+Bˆ	‰ˆ]Y\İYˆÂŸB‚˜]]ÈÛX[•X›UÚÙ[Šİœİš[™×İšY]È˜[YJH›Ù^Ù\Oˆİœİš[™×İšY]ÈÂˆ˜[YHHš[UX›QšY[
+˜[YJNÂˆYˆ
+˜[YKœÚ^™J
+HHˆ	‰ˆ˜[YK™œ›Û
+
+HOH	È‰È	‰ˆ˜[YK˜˜XÚÊ
+HOH	È‰ÊHÂˆ˜[YKœ™[[İ™WÜ™Yš^
+JNÂˆ˜[YKœ™[[İ™WÜİY™š^
+JNÂˆBˆ™]\›ˆš[UX›QšY[
+˜[YJNÂŸB‚˜]]ÈØY][U\QYš[š][ÛœÊÛÛœİİ™š[\Ş\İ[Nœ]	ˆ]ˆ][U\PØ][ÙÉˆØ][ÙÊHOˆ›ÛÛÂˆİšYœİ™X[H[œ]
+]İš[ÜÎ˜š[˜\JNÂˆYˆ
+Z[œ]š\×ÛÜ[Š
+JH™]\›ˆ˜[ÙNÂˆİ™XİÜİœİš[™ÏˆXY\œÎÂˆYˆ
+T™XYX›RXY\œÊ[œ]XY\œÊJH™]\›ˆ˜[ÙNÂˆÛÛœİ]]ÈÛÙPÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œË˜ÛÙHŠNÂˆÛÛœİ]]È\]Z]ŒPÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œË™\]Z]ŒHŠNÂˆÛÛœİ]]È\]Z]ŒÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œË™\]Z]ŒˆŠNÂˆÛÛœİ]]ÈXYÚXĞÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œË›XYÚXÈŠNÂˆÛÛœİ]]È˜\™PÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œËœ˜\™HŠNÂˆÛÛœİ]]È›Ü›X[ÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œË››Ü›X[ŠNÂˆYˆ
+XÛÙPÛÛ[[ˆY\]Z]ŒPÛÛ[[ˆY\]Z]ŒÛÛ[[‚ˆ[XYÚXĞÛÛ[[ˆ\˜\™PÛÛ[[ˆ[›Ü›X[ÛÛ[[ŠH™]\›ˆ˜[ÙNÂ‚ˆİœÚ^™Wİ›İĞÛİ[ßNÂˆİœİš[™È[™NÂˆÚ[H
+İ™Ù][™J[œ][™JJHÂˆÛÛœİ]]ÈšY[ÈHÜ]X›T›İÊ[™JNÂˆÛÛœİİœİš[™×İšY]ÈÛÙU^HX›QšY[]
+šY[Ë
+˜ÛÙPÛÛ[[ŠNÂˆİZ[Ì—İÛÙ^ßNÂˆYˆ
+ÛÙU^OHˆT\œÙR][U\PÛÙJÛÙU^ÛÙJJHÛÛ[YNÂˆYˆ
+
+ÊÜ›İĞÛİ[ˆX^[][R][U\T›İÜÊH™]\›ˆ˜[ÙNÂ‚ˆİ˜\œ˜^OİZ[Ì—İˆ\™[ŞßNÂˆÛÛœİİ˜\œ˜^OİœÚ^™Wİˆ\™[ÛÛ[[œŞÂˆ
+™\]Z]ŒPÛÛ[[‹
+™\]Z]ŒÛÛ[[ŸNÂˆ›Üˆ
+İœÚ^™Wİ[™^HÈ[™^\™[ÛÛ[[œËœÚ^™J
+NÈ
+ÊÚ[™^
+HÂˆÛÛœİİœİš[™×İšY]È\™[^HX›QšY[]
+šY[Ë\™[ÛÛ[[œÖÚ[™^JNÂˆYˆ
+\™[^OHŠHÂˆ
+›ÚY
+T\œÙR][U\PÛÙJ\™[^\™[ÖÚ[™^JNÂˆBˆBˆØ][ÙËšÛ›İÛ•\PÛÙ\Ëš[œÙ\
+ÛÙJNÂˆØ][ÙËœ\™[\\ÖØÛÙWHH\™[ÎÂˆØ][ÙËœ]X[]Q›YÜĞU\VØÛÙWHHÂˆ›XYÚXÈH\Ñ[˜X›YX›Q›YÊX›QšY[]
+šY[Ë
+›XYÚXĞÛÛ[[ŠJKˆœ˜\™HH\Ñ[˜X›YX›Q›YÊX›QšY[]
+šY[Ë
+œ˜\™PÛÛ[[ŠJKˆ››Ü›X[H\Ñ[˜X›YX›Q›YÊX›QšY[]
+šY[Ë
+››Ü›X[ÛÛ[[ŠJKˆNÂˆBˆ™]\›ˆZ[œ]˜˜Y
+
+H	‰ˆ›İĞÛİ[OHÂŸB‚˜]]ÈØY][U\SY[X™\œÚ\ÊÛÛœİİ™š[\Ş\İ[Nœ]	ˆ]ˆ][U\PØ][ÙÉˆØ][ÙËİœÚ^™Wİ	ˆİ[›İÜËˆ›ÛÛ\]Z\Y[X›JHOˆ›ÛÛÂˆİšYœİ™X[H[œ]
+]İš[ÜÎ˜š[˜\JNÂˆYˆ
+Z[œ]š\×ÛÜ[Š
+JH™]\›ˆ˜[ÙNÂˆİ™XİÜİœİš[™ÏˆXY\œÎÂˆYˆ
+T™XYX›RXY\œÊ[œ]XY\œÊJH™]\›ˆ˜[ÙNÂˆÛÛœİ]]ÈÛÙPÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œË˜ÛÙHŠNÂˆÛÛœİ]]È\PÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œË\HŠNÂˆÛÛœİ]]È\LÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œË\LˆŠNÂˆÛÛœİ]]È]Y\İÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œËœ]Y\İŠNÂˆYˆ
+XÛÙPÛÛ[[ˆ]\PÛÛ[[ŠH™]\›ˆ˜[ÙNÂˆÛÛœİ]]È›Ü›PÛÙPÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œË››Ü›XÛÙHŠNÂˆÛÛœİ]]ÈX™\ÛÙPÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œËX™\˜ÛÙHŠNÂˆÛÛœİ]]È[˜PÛÙPÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œË[˜XÛÙHŠNÂ‚ˆİœÚ^™WİX›T›İÜŞßNÂˆİœİš[™È[™NÂˆÚ[H
+İ™Ù][™J[œ][™JJHÂˆÛÛœİ]]ÈšY[ÈHÜ]X›T›İÊ[™JNÂˆİZ[Ì—İ][PÛÙ^ßNÂˆYˆ
+T\œÙR][PÛÙJX›QšY[]
+šY[Ë
+˜ÛÙPÛÛ[[ŠK][PÛÙJJHÛÛ[YNÂˆYˆ
+
+ÊİX›T›İÜÈˆX^[][R][T›İÜÈ
+Êİİ[›İÜÈˆX^[][R][T›İÜÊHÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆYˆ
+]Y\İÛÛ[[‚ˆ	‰ˆ\Ô]Y\İX›U˜[YJX›QšY[]
+šY[Ë
+œ]Y\İÛÛ[[ŠJJHÂˆØ][ÙËœ]Y\İ][PÛÙ\Ëš[œÙ\
+][PÛÙJNÂˆB‚ˆ]]ÉˆY[X™\œÚ\ÈHØ][ÙËš][U\\ĞR][PÛÙVÚ][PÛÙWNÂˆÛÛœİİ˜\œ˜^Oİ›Ü[Û˜[İœÚ^™Wİ‹ˆ\PÛÛ[[œŞÂˆ\PÛÛ[[‹\LÛÛ[[ŸNÂˆ›Üˆ
+ÛÛœİ]]ÈÛÛ[[ˆˆ\PÛÛ[[œÊHÂˆYˆ
+XÛÛ[[ŠHÛÛ[YNÂˆİZ[Ì—İ\PÛÙ^ßNÂˆÛÛœİİœİš[™×İšY]È\U^HX›QšY[]
+šY[Ë
+˜ÛÛ[[ŠNÂˆYˆ
+\œÙR][U\PÛÙJ\U^\PÛÙJBˆ	‰ˆØ][ÙËšÛ›İÛ•\PÛÙ\Ë˜ÛÛZ[œÊ\PÛÙJBˆ	‰ˆİ™š[™
+Y[X™\œÚ\Ë˜™YÚ[Š
+KY[X™\œÚ\Ë™[™
+
+K\PÛÙJBˆOHY[X™\œÚ\Ë™[™
+
+JHÂˆY[X™\œÚ\Ëœ\ÚØ˜XÚÊ\PÛÙJNÂˆØ][ÙË™\™Xİ][U\\ĞR][PÛÙVÚ][PÛÙWKœ\ÚØ˜XÚÊ\PÛÙJNÂˆBˆBˆYˆ
+\]Z\Y[X›JHÂˆØ][ÙË™\]Z\Y[][PÛÙ\Ëš[œÙ\
+][PÛÙJNÂˆİZ[Ì—İ˜[Z[HH][PÛÙNÂˆİ™XİÜİZ[Ì—İˆ˜[Z[PÛÙ\ŞÚ][PÛÙ_NÂˆÛÛœİİ˜\œ˜^Oİ›Ü[Û˜[İœÚ^™Wİ‹Ïˆ˜[Z[PÛÛ[[œŞÂˆ›Ü›PÛÙPÛÛ[[‹X™\ÛÙPÛÛ[[‹[˜PÛÙPÛÛ[[ŸNÂˆ›Üˆ
+ÛÛœİ]]ÈÛÛ[[ˆˆ˜[Z[PÛÛ[[œÊHÂˆYˆ
+XÛÛ[[ŠHÛÛ[YNÂˆİZ[Ì—İ˜[Z[PÛÙ^ßNÂˆYˆ
+\œÙR][PÛÙJX›QšY[]
+šY[Ë
+˜ÛÛ[[ŠK˜[Z[PÛÙJJHÂˆ˜[Z[PÛÙ\Ëœ\ÚØ˜XÚÊ˜[Z[PÛÙJNÂˆYˆ
+ÛÛ[[ˆOH›Ü›PÛÙPÛÛ[[ŠH˜[Z[HH˜[Z[PÛÙNÂˆBˆBˆ›Üˆ
+ÛÛœİİZ[Ì—İ˜[Z[PÛÙHˆ˜[Z[PÛÙ\ÊHÂˆØ][ÙËš][Q˜[Z[PR][PÛÙVÙ˜[Z[PÛÙWHH˜[Z[NÂˆBˆBˆBˆ™]\›ˆZ[œ]˜˜Y
+
+H	‰ˆX›T›İÜÈOHÂŸB‚˜]]ÈØY]X[]T™XÛÜ™ÛÙ\ÊÛÛœİİ™š[\Ş\İ[Nœ]	ˆ]ˆİœİš[™×İšY]ÈÛÙPÛÛ[[“˜[YKˆİ[›Ü™\™YÜÙ]İZ[Ì—İ‰ˆ\İ[˜][ÛŠHOˆ›ÛÛÂˆİšYœİ™X[H[œ]
+]İš[ÜÎ˜š[˜\JNÂˆYˆ
+Z[œ]š\×ÛÜ[Š
+JH™]\›ˆ˜[ÙNÂˆİ™XİÜİœİš[™ÏˆXY\œÎÂˆYˆ
+T™XYX›RXY\œÊ[œ]XY\œÊJH™]\›ˆ˜[ÙNÂˆÛÛœİ]]ÈÛÙPÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œËÛÙPÛÛ[[“˜[YJNÂˆÛÛœİ]]È\ØX›YÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œË™\ØX›YŠNÂˆÛÛœİ]]ÈÜ]Û˜X›PÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œËœÜ]Û˜X›HŠNÂˆYˆ
+XÛÙPÛÛ[[ŠH™]\›ˆ˜[ÙNÂ‚ˆİœÚ^™Wİ›İĞÛİ[ßNÂˆİœİš[™È[™NÂˆÚ[H
+İ™Ù][™J[œ][™JJHÂˆÛÛœİ]]ÈšY[ÈHÜ]X›T›İÊ[™JNÂˆÛÛœİİœİš[™×İšY]ÈÛÙU^HX›QšY[]
+šY[Ë
+˜ÛÙPÛÛ[[ŠNÂˆİZ[Ì—İÛÙ^ßNÂˆYˆ
+T\œÙR][PÛÙJÛÙU^ÛÙJJHÛÛ[YNÂˆYˆ
+
+ÊÜ›İĞÛİ[ˆX^[][R][T›İÜÊH™]\›ˆ˜[ÙNÂˆYˆ
+\ØX›YÛÛ[[ˆ	‰ˆ\Ñ[˜X›YX›Q›YÊˆX›QšY[]
+šY[Ë
+™\ØX›YÛÛ[[ŠJJHÂˆÛÛ[YNÂˆBˆÛÛœİİœİš[™×İšY]ÈÜ]Û˜X›HHÜ]Û˜X›PÛÛ[[‚ˆÈX›QšY[]
+šY[Ë
+œÜ]Û˜X›PÛÛ[[ŠHˆİœİš[™×İšY]ŞßNÂˆYˆ
+\Ü]Û˜X›K™[\J
+H	‰ˆR\Ñ[˜X›YX›Q›YÊÜ]Û˜X›JJHÛÛ[YNÂˆ\İ[˜][Û‹š[œÙ\
+ÛÙJNÂˆBˆ™]\›ˆZ[œ]˜˜Y
+
+H	‰ˆ›İĞÛİ[OHÂŸB‚˜]]ÈØYÜ˜Y]X[]T[\ÊÛÛœİİ™š[\Ş\İ[Nœ]	ˆ]ˆ][U\PØ][ÙÉˆØ][ÙÊHOˆ›ÛÛÂˆİšYœİ™X[H[œ]
+]İš[ÜÎ˜š[˜\JNÂˆYˆ
+Z[œ]š\×ÛÜ[Š
+JH™]\›ˆ˜[ÙNÂˆİ™XİÜİœİš[™ÏˆXY\œÎÂˆYˆ
+T™XYX›RXY\œÊ[œ]XY\œÊJH™]\›ˆ˜[ÙNÂˆÛÛœİ]]È[˜X›YÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œË™[˜X›YŠNÂˆÛÛœİ]]Èİ]]ÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œË›İ]]ŠNÂˆÛÛœİ]]È[œ]ÛÛ[[ˆHš[™X›PÛÛ[[ŠXY\œËš[œ]HŠNÂˆYˆ
+[İ]]ÛÛ[[ˆZ[œ]ÛÛ[[ŠH™]\›ˆ˜[ÙNÂ‚ˆİœÚ^™Wİ›İĞÛİ[ßNÂˆİœİš[™È[™NÂˆÚ[H
+İ™Ù][™J[œ][™JJHÂˆÛÛœİ]]ÈšY[ÈHÜ]X›T›İÊ[™JNÂˆÛÛœİİœİš[™×İšY]Èİ]]HÛX[•X›UÚÙ[ŠˆX›QšY[]
+šY[Ë
+›İ]]ÛÛ[[ŠJNÂˆ›ÛÛÜ™X]\ĞÜ˜YYßNÂˆİœÚ^™Wİİ]]İ\ßNÂˆ›Üˆ
+ÎÊHÂˆÛÛœİİœÚ^™WİÛÛ[XHHİ]]™š[™
+	Ë	Ëİ]]İ\
+NÂˆYˆ
+ÛX[•X›UÚÙ[Šİ]]œİXœİŠİ]]İ\ˆÛÛ[XHOHİœİš[™×İšY]Î›œÜÂˆÈİ]]œÚ^™J
+HHİ]]İ\ˆÛÛ[XHHİ]]İ\
+JHOH˜Ü™ˆŠHÂˆÜ™X]\ĞÜ˜YYHYNÂˆœ™XZÎÂˆBˆYˆ
+ÛÛ[XHOHİœİš[™×İšY]Î›œÜÊHœ™XZÎÂˆİ]]İ\HÛÛ[XH
+ÈNÂˆBˆYˆ
+XÜ™X]\ĞÜ˜YY
+HÛÛ[YNÂˆYˆ
+
+ÊÜ›İĞÛİ[ˆX^[][R][T›İÜÊH™]\›ˆ˜[ÙNÂˆYˆ
+[˜X›YÛÛ[[ŠHÂˆÛÛœİİœİš[™×İšY]È[˜X›YHX›QšY[]
+šY[Ë
+™[˜X›YÛÛ[[ŠNÂˆYˆ
+Y[˜X›Y™[\J
+H	‰ˆR\Ñ[˜X›YX›Q›YÊ[˜X›Y
+JHÛÛ[YNÂˆB‚ˆÛÛœİİœİš[™×İšY]È[œ]ÜXÈHÛX[•X›UÚÙ[ŠˆX›QšY[]
+šY[Ë
+š[œ]ÛÛ[[ŠJNÂˆÛÛœİİœÚ^™WİÛÛ[XHH[œ]ÜXË™š[™
+	Ë	ÊNÂˆÛÛœİİœİš[™×İšY]ÈÙ[XİÜˆHÛX[•X›UÚÙ[Šˆ[œ]ÜXËœİXœİŠÛÛ[XJJNÂˆ›ÛÛ\Ü˜YYßNÂˆİœÚ^™WİÜ[Û”İ\HÛÛ[XHOHİœİš[™×İšY]Î›œÜÂˆÈ[œ]ÜXËœÚ^™J
+HˆÛÛ[XH
+ÈNÂˆÚ[H
+Ü[Û”İ\[œ]ÜXËœÚ^™J
+JHÂˆÛÛœİİœÚ^™WİÜ[Û‘[™H[œ]ÜXË™š[™
+	Ë	ËÜ[Û”İ\
+NÂˆÛÛœİİœİš[™×İšY]ÈÜ[ÛˆHÛX[•X›UÚÙ[Š[œ]ÜXËœİXœİŠˆÜ[Û”İ\Ü[Û‘[™OHİœİš[™×İšY]Î›œÜÂˆÈ[œ]ÜXËœÚ^™J
+HHÜ[Û”İ\ˆÜ[Û‘[™HÜ[Û”İ\
+JNÂˆ\Ü˜YYH\Ü˜YYÜ[ÛˆOH\ÈÂˆYˆ
+Ü[Û‘[™OHİœİš[™×İšY]Î›œÜÊHœ™XZÎÂˆÜ[Û”İ\HÜ[Û‘[™
+ÈNÂˆB‚ˆİZ[Ì—İÛÙ^ßNÂˆYˆ
+\œÙR][U\PÛÙJÙ[XİÜ‹ÛÙJBˆ	‰ˆØ][ÙËšÛ›İÛ•\PÛÙ\Ë˜ÛÛZ[œÊÛÙJJHÂˆØ][ÙË˜Ü˜YY][U\PÛÙ\Ëš[œÙ\
+ÛÙJNÂˆH[ÙHYˆ
+\œÙR][PÛÙJÙ[XİÜ‹ÛÙJJHÂˆØ][ÙË˜Ü˜YY][PÛÙ\Ëš[œÙ\
+ÛÙJNÂˆYˆ
+\Ü˜YY
+HÂˆÛÛœİ]]È˜[Z[HHØ][ÙËš][Q˜[Z[PR][PÛÙK™š[™
+ÛÙJNÂˆØ][ÙË˜Ü˜YY][Q˜[Z[Y\Ëš[œÙ\
+˜[Z[HOHØ][ÙËš][Q˜[Z[PR][PÛÙK™[™
+
+BˆÈÛÙHˆ˜[Z[KOœÙXÛÛ™
+NÂˆBˆBˆBˆ™]\›ˆZ[œ]˜˜Y
+
+H	‰ˆ›İĞÛİ[OHÂŸB‚˜]]ÈY]X[]RY“Z\ÜÚ[™Êİ™XİÜ”“’][\Î”]X[]O‰ˆ]X[]Y\Ëˆ”“’][\Î”]X[]H]X[]JHOˆ›ÚYÂˆYˆ
+İ™š[™
+]X[]Y\Ë˜™YÚ[Š
+K]X[]Y\Ë™[™
+
+K]X[]JHOH]X[]Y\Ë™[™
+
+JHÂˆ]X[]Y\Ëœ\ÚØ˜XÚÊ]X[]JNÂˆBŸB‚˜]]È\ĞÜ˜YY]X[]JÛÛœİ][U\PØ][ÙÉˆØ][ÙËˆİZ[Ì—İ][PÛÙKˆÛÛœİİ™XİÜİZ[Ì—İ‰ˆ][U\\ÊH›Ù^Ù\Oˆ›ÛÛÂˆYˆ
+Ø][ÙË˜Ü˜YY][PÛÙ\Ë˜ÛÛZ[œÊ][PÛÙJJH™]\›ˆYNÂˆ›Üˆ
+ÛÛœİİZ[Ì—İ\PÛÙHˆ][U\\ÊHÂˆYˆ
+Ø][ÙË˜Ü˜YY][U\PÛÙ\Ë˜ÛÛZ[œÊ\PÛÙJJH™]\›ˆYNÂˆBˆÛÛœİ]]È˜[Z[HHØ][ÙËš][Q˜[Z[PR][PÛÙK™š[™
+][PÛÙJNÂˆ™]\›ˆ˜[Z[HOHØ][ÙËš][Q˜[Z[PR][PÛÙK™[™
+
+Bˆ	‰ˆØ][ÙË˜Ü˜YY][Q˜[Z[Y\Ë˜ÛÛZ[œÊ˜[Z[KOœÙXÛÛ™
+NÂŸB‚˜]]ÈZ[İ]]]X[]PØ][ÙÊ][U\PØ][ÙÉˆØ][ÙÊHOˆ›ÚYÂˆ›Üˆ
+ÛÛœİ]]ÉˆÚ][PÛÙK][U\\×HˆØ][ÙËš][U\\ĞR][PÛÙJHÂˆİ™XİÜ”“’][\Î”]X[]Oˆ]X[]Y\ÎÂˆYˆ
+Ø][ÙË™\]Z\Y[][PÛÙ\Ë˜ÛÛZ[œÊ][PÛÙJJHÂˆY]X[]RY“Z\ÜÚ[™Ê]X[]Y\Ë”“’][\Î”]X[]N’[™™\š[ÜŠNÂˆY]X[]RY“Z\ÜÚ[™Ê]X[]Y\Ë”“’][\Î”]X[]N“›Ü›X[
+NÂˆY]X[]RY“Z\ÜÚ[™Ê]X[]Y\Ë”“’][\Î”]X[]N”İ\\š[ÜŠNÂˆY]X[]RY“Z\ÜÚ[™Ê]X[]Y\Ë”“’][\Î”]X[]N“XYÚXÊNÂˆY]X[]RY“Z\ÜÚ[™Ê]X[]Y\Ë”“’][\Î”]X[]N”˜\™JNÂˆH[ÙHÂˆÛÛœİ]]È\™Xİ\\ÈHØ][ÙË™\™Xİ][U\\ĞR][PÛÙK™š[™
+][PÛÙJNÂˆYˆ
+\™Xİ\\ÈOHØ][ÙË™\™Xİ][U\\ĞR][PÛÙK™[™
+
+JHÂˆ›Üˆ
+ÛÛœİİZ[Ì—İ\PÛÙHˆ\™Xİ\\ËOœÙXÛÛ™
+HÂˆÛÛœİ]]È›YÜÈHØ][ÙËœ]X[]Q›YÜĞU\K™š[™
+\PÛÙJNÂˆYˆ
+›YÜÈOHØ][ÙËœ]X[]Q›YÜĞU\K™[™
+
+JHÛÛ[YNÂˆYˆ
+›YÜËOœÙXÛÛ™››Ü›X[
+HÂˆY]X[]RY“Z\ÜÚ[™Ê]X[]Y\Ë”“’][\Î”]X[]N“›Ü›X[
+NÂˆBˆYˆ
+›YÜËOœÙXÛÛ™›XYÚXÊHÂˆY]X[]RY“Z\ÜÚ[™Ê]X[]Y\Ë”“’][\Î”]X[]N“XYÚXÊNÂˆBˆYˆ
+›YÜËOœÙXÛÛ™œ˜\™JHÂˆY]X[]RY“Z\ÜÚ[™Ê]X[]Y\Ë”“’][\Î”]X[]N”˜\™JNÂˆBˆBˆBˆËÈ[ÜİZ\ØÙ[[™[İ\È][\È]™HÛ™Hš^Y›Ü›X[]X[]Kˆ][U\\ÂˆËÈ^XÚ]HX\šÜÈ™]Ù[H[™Ú\›\È]Ø[ˆ[œİXY™HXYÚXËÔ˜\™K‚ˆYˆ
+]X[]Y\Ë™[\J
+JHÂˆY]X[]RY“Z\ÜÚ[™Ê]X[]Y\Ë”“’][\Î”]X[]N“›Ü›X[
+NÂˆBˆBˆYˆ
+Ø][ÙËœÙ]][PÛÙ\Ë˜ÛÛZ[œÊ][PÛÙJJHÂˆY]X[]RY“Z\ÜÚ[™Ê]X[]Y\Ë”“’][\Î”]X[]N”Ù]
+NÂˆBˆYˆ
+Ø][ÙË[š\]YR][PÛÙ\Ë˜ÛÛZ[œÊ][PÛÙJJHÂˆY]X[]RY“Z\ÜÚ[™Ê]X[]Y\Ë”“’][\Î”]X[]N•[š\]YJNÂˆBˆYˆ
+\ĞÜ˜YY]X[]JØ][ÙË][PÛÙK][U\\ÊJHÂˆY]X[]RY“Z\ÜÚ[™Ê]X[]Y\Ë”“’][\Î”]X[]NÜ˜YY
+NÂˆBˆØ][ÙË˜[Y]X[]Y\ĞR][PÛÙK™[\XÙJ][PÛÙKİ›[İ™J]X[]Y\ÊJNÂˆBŸB‚œİXİ][U\Q^Ù[\™XİÜHÂˆİ™š[\Ş\İ[Nœ]]Âˆ›ÛÛÛÛ\[\‘˜[˜XÚŞßNÂŸNÂ‚˜]]Èš[™][U\Q^Ù[\™XİÜJ
+HOˆİ›Ü[Û˜[][U\Q^Ù[\™XİÜOˆÂˆİ™XİÜİ™š[\Ş\İ[Nœ]ˆ›ÛİÎÂˆYˆ
+ÛÛ^OH[ˆ	‰ˆÛÛ^O›[Ù\™XİÜHOH[‚ˆ	‰ˆÛÛ^O›[Ù\™XİÜVÌHOH	×	ÊHÂˆ›ÛİË™[\XÙWØ˜XÚÊÛÛ^O›[Ù\™XİÜJNÂˆBˆÛÛœİ]]ÈÛÛ™šYÔ]HÛÛ™šYÔ]
+
+NÂˆYˆ
+XÛÛ™šYÔ]™[\J
+JHÂˆ›ÛİËœ\ÚØ˜XÚÊÛÛ™šYÔ]œ\™[Ü]
+
+Kœ\™[Ü]
+
+JNÂˆB‚ˆİ™XİÜİ™š[\Ş\İ[Nœ]ˆØ[™Y]\ÎÂˆİœİš[™È[Ù˜[YNÂˆYˆ
+ÛÛ^OH[ˆ	‰ˆÛÛ^O˜Xİ]™S[ÙOH[ŠHÂˆ[Ù˜[YHHÛÛ^O˜Xİ]™S[ÙÂˆYˆ
+[Ù˜[YK™š[™Ùš\œİÛÙŠ‹×ˆŠHOHİœİš[™Î›œÜÊHÂˆ[Ù˜[YK˜ÛX\Š
+NÂˆBˆYˆ
+[[Ù˜[YK™[\J
+Bˆ	‰ˆ
+[Ù˜[YKœÚ^™J
+Hˆ[Ù˜[YKœİXœİŠ[Ù˜[YKœÚ^™J
+HH
+HOH‹›\HŠJHÂˆ[Ù˜[YH
+ÏH‹›\HÂˆBˆB‚ˆ›Üˆ
+ÛÛœİ]]Éˆ›Ûİˆ›ÛİÊHÂˆYˆ
+[[Ù˜[YK™[\J
+JHÂˆİNİš[™È[Ù˜[YU]Âˆ[Ù˜[YU]œ™\Ù\™J[Ù˜[YKœÚ^™J
+JNÂˆ›Üˆ
+ÛÛœİ[œÚYÛ™YÚ\ˆÚ\˜Xİ\ˆˆ[Ù˜[YJHÂˆ[Ù˜[YU]œ\ÚØ˜XÚÊİ]X×ØØ\İÚ\İŠÚ\˜Xİ\ŠJNÂˆBˆØ[™Y]\Ëœ\ÚØ˜XÚÊ›ÛİÈİ™š[\Ş\İ[Nœ]
+[Ù˜[YU]
+BˆÈ™]HˆÈ™ÛØ˜[ˆÈ™^Ù[ŠNÂˆBˆØ[™Y]\Ëœ\ÚØ˜XÚÊ›ÛİÈ™]HˆÈ™ÛØ˜[ˆÈ™^Ù[ŠNÂˆB‚ˆİ™XİÜİ™š[\Ş\İ[Nœ]ˆÛÛ\[\‘˜[˜XÚĞØ[™Y]\ÎÂˆ›Üˆ
+ÛÛœİ]]Éˆ›Ûİˆ›ÛİÊHÂˆÛÛœİ]]È˜[˜XÚÈH›ÛİÈ™]HˆÈ˜ÛÛ\[\ˆˆÈŒËŒËŒ‚ˆÈ™]HˆÈ™ÛØ˜[ˆÈ™^Ù[ÂˆYˆ
+İ™š[™
+ÛÛ\[\‘˜[˜XÚĞØ[™Y]\Ë˜™YÚ[Š
+KˆÛÛ\[\‘˜[˜XÚĞØ[™Y]\Ë™[™
+
+K˜[˜XÚÊBˆOHÛÛ\[\‘˜[˜XÚĞØ[™Y]\Ë™[™
+
+JHÂˆÛÛ\[\‘˜[˜XÚĞØ[™Y]\Ëœ\ÚØ˜XÚÊ˜[˜XÚÊNÂˆBˆB‚ˆÛÛœİ^ˆİ˜\œ˜^OÛÛœİØÚ\—İ
+‹ˆ™\]Z\™Yš[\ŞÂˆš][]\\Ë‹˜\›[Ü‹‹ÙX\ÛœË‹›Z\ØËŸNÂˆÛÛœİ]]È\Ô™\]Z\™Yš[\ÈHÉ—JÛÛœİİ™š[\Ş\İ[Nœ]	ˆØ[™Y]JHÂˆ›ÛÛÛÛ\]HHYNÂˆ›Üˆ
+ÛÛœİØÚ\—İ
+ˆš[[˜[YHˆ™\]Z\™Yš[\ÊHÂˆİ™\œ›Ü—ØÛÙH\œ›ÜÂˆYˆ
+\İ™š[\Ş\İ[Nš\×Ü™Yİ[\—Ùš[JØ[™Y]HÈš[[˜[YK\œ›ÜŠBˆ\œ›ÜŠHÂˆÛÛ\]HH˜[ÙNÂˆœ™XZÎÂˆBˆBˆ™]\›ˆÛÛ\]NÂˆNÂˆ›Üˆ
+ÛÛœİ]]ÉˆØ[™Y]HˆØ[™Y]\ÊHÂˆYˆ
+\Ô™\]Z\™Yš[\ÊØ[™Y]JJH™]\›ˆ][U\Q^Ù[\™XİÜ^Âˆœ]HØ[™Y]Kˆ˜ÛÛ\[\‘˜[˜XÚÈH˜[ÙKˆNÂˆBˆ›Üˆ
+ÛÛœİ]]ÉˆØ[™Y]HˆÛÛ\[\‘˜[˜XÚĞØ[™Y]\ÊHÂˆYˆ
+\Ô™\]Z\™Yš[\ÊØ[™Y]JJH™]\›ˆ][U\Q^Ù[\™XİÜ^Âˆœ]HØ[™Y]Kˆ˜ÛÛ\[\‘˜[˜XÚÈHYKˆNÂˆBˆ™]\›ˆİ›[ÜÂŸB‚˜]]ÈØY][U\PØ][ÙÊ›ÛÛ	ˆ\ÙYÛÛ\[\‘˜[˜XÚÊH›Ù^Ù\Oˆ›ÛÛÂˆ][U\Q]HHßNÂˆ\ÙYÛÛ\[\‘˜[˜XÚÈH˜[ÙNÂˆHÂˆÛÛœİ]]È^Ù[\™XİÜHHš[™][U\Q^Ù[\™XİÜJ
+NÂˆYˆ
+Y^Ù[\™XİÜJH™]\›ˆ˜[ÙNÂ‚ˆ][U\PØ][ÙÈØ][ÙÎÂˆYˆ
+SØY][U\QYš[š][ÛœÊ^Ù[\™XİÜKOœ]Èš][]\\Ë‹Ø][ÙÊJHÂˆ™]\›ˆ˜[ÙNÂˆBˆİœÚ^™Wİİ[][T›İÜŞßNÂˆYˆ
+SØY][U\SY[X™\œÚ\Ê^Ù[\™XİÜKOœ]È˜\›[Ü‹‹ˆØ][ÙËİ[][T›İÜËYJBˆSØY][U\SY[X™\œÚ\Ê^Ù[\™XİÜKOœ]ÈÙX\ÛœË‹ˆØ][ÙËİ[][T›İÜËYJBˆSØY][U\SY[X™\œÚ\Ê^Ù[\™XİÜKOœ]È›Z\ØË‹ˆØ][ÙËİ[][T›İÜË˜[ÙJJHÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆ
+›ÚY
+SØY]X[]T™XÛÜ™ÛÙ\Ê^Ù[\™XİÜKOœ]È[š\]YZ][\Ë‹ˆ˜ÛÙH‹Ø][ÙË[š\]YR][PÛÙ\ÊNÂˆ
+›ÚY
+SØY]X[]T™XÛÜ™ÛÙ\Ê^Ù[\™XİÜKOœ]ÈœÙ]][\Ë‹ˆš][H‹Ø][ÙËœÙ]][PÛÙ\ÊNÂˆ
+›ÚY
+SØYÜ˜Y]X[]T[\Ê^Ù[\™XİÜKOœ]È˜İX™[XZ[‹‹Ø][ÙÊNÂ‚ˆ›Üˆ
+]]ÉˆÚ][PÛÙKY[X™\œÚ\×HˆØ][ÙËš][U\\ĞR][PÛÙJHÂˆ
+›ÚY
+Z][PÛÙNÂˆİ™XİÜİZ[Ì—İˆ^[™YÂˆ›Üˆ
+İZ[Ì—İ\PÛÙHˆY[X™\œÚ\ÊHÂˆYˆ
+İ™š[™
+^[™Y˜™YÚ[Š
+K^[™Y™[™
+
+K\PÛÙJBˆOH^[™Y™[™
+
+JHÂˆ^[™Yœ\ÚØ˜XÚÊ\PÛÙJNÂˆBˆBˆ›Üˆ
+İœÚ^™Wİ[™^HÈ[™^^[™YœÚ^™J
+NÈ
+ÊÚ[™^
+HÂˆÛÛœİ]]È\™[ÈHØ][ÙËœ\™[\\Ë™š[™
+^[™YÚ[™^JNÂˆYˆ
+\™[ÈOHØ][ÙËœ\™[\\Ë™[™
+
+JHÛÛ[YNÂˆ›Üˆ
+İZ[Ì—İ\™[ˆ\™[ËOœÙXÛÛ™
+HÂˆYˆ
+\™[OH	‰ˆØ][ÙËšÛ›İÛ•\PÛÙ\Ë˜ÛÛZ[œÊ\™[
+Bˆ	‰ˆİ™š[™
+^[™Y˜™YÚ[Š
+K^[™Y™[™
+
+K\™[
+BˆOH^[™Y™[™
+
+JHÂˆ^[™Yœ\ÚØ˜XÚÊ\™[
+NÂˆBˆBˆBˆY[X™\œÚ\ÈHİ›[İ™J^[™Y
+NÂˆBˆØ][ÙË˜]˜Z[X›HHYNÂˆZ[İ]]]X[]PØ][ÙÊØ][ÙÊNÂˆ][U\Q]HHİ›[İ™JØ][ÙÊNÂˆ\ÙYÛÛ\[\‘˜[˜XÚÈH^Ù[\™XİÜKO˜ÛÛ\[\‘˜[˜XÚÎÂˆ™]\›ˆYNÂˆHØ]Ú
+‹‹ŠHÂˆ][U\Q]HHßNÂˆ™]\›ˆ˜[ÙNÂˆBŸB‚˜]]È\œÙPÛÛ™šYÊİœİš[™×İšY]È^Ù][™ÜÉˆ\İ[˜][Û‹ˆİœİš[™Éˆ\œ›ÜŠHOˆ›ÛÛÂˆHÂˆÛÛœİ]]È›ÛİHÛ[œ\œÙJ^
+NÂˆÛÛœİ]]ÊˆÙXİ[Û“›ÙHH›Ûİ™Ù]
+[[X]K\ØÜ˜\\ˆŠNÂˆYˆ
+ÙXİ[Û“›ÙHOH[ŠH™]\›ˆYNÂˆÛÛœİ]]ÊˆÙXİ[ÛˆHÙXİ[Û“›ÙKO˜\×İX›J
+NÂˆYˆ
+ÙXİ[ÛˆOH[ŠHÂˆ\œ›ÜˆH[[X]K\ØÜ˜\\ˆ]\İ™HHÓSX›HÂˆ™]\›ˆ˜[ÙNÂˆBˆ
+›ÚY
+T\œÙR[œ][\Ê
+œÙXİ[Û‹\İ[˜][Û‹š[œ]
+NÂˆYˆ
+ÛÛœİ]]Êˆ[ÙS›ÙHHÙXİ[Û‹O™Ù]
+˜Xİ]™K[İ]][[ÙHŠJHÂˆÛÛœİ]]È[ÙHH[ÙS›ÙKO˜[YOİœİš[™ÏŠ
+NÂˆYˆ
+[[ÙJHÂˆ\œ›ÜˆH[[X]K\ØÜ˜\\‹˜Xİ]™K[İ]][[ÙH]\İ™H”[™\×‹İ\İÛW‹Üˆ›İˆÂˆ™]\›ˆ˜[ÙNÂˆBˆYˆ
+
+›[ÙHOH”[™\ÈŠHÂˆ\İ[˜][Û‹˜Xİ]™Sİ]][ÙHHİ]][ÙN”[™\ÎÂˆH[ÙHYˆ
+
+›[ÙHOHİ\İÛHŠHÂˆ\İ[˜][Û‹˜Xİ]™Sİ]][ÙHHİ]][ÙNİ\İÛNÂˆH[ÙHYˆ
+
+›[ÙHOH›İŠHÂˆ\İ[˜][Û‹˜Xİ]™Sİ]][ÙHHİ]][ÙN›İÂˆH[ÙHÂˆ\œ›ÜˆH[[X]K\ØÜ˜\\‹˜Xİ]™K[İ]][[ÙH]\İ™H”[™\×‹İ\İÛW‹Üˆ›İˆÂˆ™]\›ˆ˜[ÙNÂˆBˆBˆYˆ
+ÛÛœİ]]Êˆ]Û“[ÙS›ÙHHÙXİ[Û‹O™Ù]
+˜[œÛ]]KX]Û‹[[ÙHŠJHÂˆÛÛœİ]]È]Û“[ÙHH]Û“[ÙS›ÙKO˜[YOİœİš[™ÏŠ
+NÂˆYˆ
+X]Û“[ÙJHÂˆ\œ›ÜˆH[[X]K\ØÜ˜\\‹˜[œÛ]]KX]Û‹[[ÙH]\İ™H“˜]]™WˆÜˆ”Ù\\˜]WˆÂˆ™]\›ˆ˜[ÙNÂˆBˆYˆ
+
+˜]Û“[ÙHOH“˜]]™HŠHÂˆ\İ[˜][Û‹˜[œÛ]]P]Û“[ÙHH˜[œÛ]]P]Û“[ÙN“˜]]™NÂˆH[ÙHYˆ
+
+˜]Û“[ÙHOH”Ù\\˜]HŠHÂˆ\İ[˜][Û‹˜[œÛ]]P]Û“[ÙHH˜[œÛ]]P]Û“[ÙN”Ù\\˜]NÂˆH[ÙHÂˆ\œ›ÜˆH[[X]K\ØÜ˜\\‹˜[œÛ]]KX]Û‹[[ÙH]\İ™H“˜]]™WˆÜˆ”Ù\\˜]WˆÂˆ™]\›ˆ˜[ÙNÂˆBˆBˆYˆ
+ÛÛœİ]]Êˆ˜]ÚÚXÚØ›Ş›ÙHHÙXİ[Û‹O™Ù]
+ˆœÚİËX˜]ÚXÚXÚØ›Ş\ÈŠJHÂˆÛÛœİ]]ÈÚİĞ˜]ÚÚXÚØ›Ş\ÈH˜]ÚÚXÚØ›Ş›ÙKO˜[YO›ÛÛŠ
+NÂˆYˆ
+\ÚİĞ˜]ÚÚXÚØ›Ş\ÊHÂˆ\œ›ÜˆH[[X]K\ØÜ˜\\‹œÚİËX˜]ÚXÚXÚØ›Ş\È]\İ™HYHÜˆ˜[ÙHÂˆ™]\›ˆ˜[ÙNÂˆBˆ\İ[˜][Û‹œÚİĞ˜]ÚÚXÚØ›Ş\ÈH
+œÚİĞ˜]ÚÚXÚØ›Ş\ÎÂˆBˆYˆ
+ÛÛœİ]]Êˆ˜]Ú[Ø^\ÓÛ“›ÙHHÙXİ[Û‹O™Ù]
+ˆ˜˜]Ú\ØÜ˜\X[Ø^\Ë[ÛˆŠJHÂˆÛÛœİ]]È˜]Ú[Ø^\ÓÛˆH˜]Ú[Ø^\ÓÛ“›ÙKO˜[YO›ÛÛŠ
+NÂˆYˆ
+X˜]Ú[Ø^\ÓÛŠHÂˆ\œ›ÜˆH[[X]K\ØÜ˜\\‹˜˜]Ú\ØÜ˜\X[Ø^\Ë[Ûˆ]\İ™HYHÜˆ˜[ÙHÂˆ™]\›ˆ˜[ÙNÂˆBˆ\İ[˜][Û‹˜˜]ÚØÜ˜\[Ø^\ÓÛˆH
+˜˜]Ú[Ø^\ÓÛÂˆB‚ˆYˆ
+\İ[˜][Û‹˜Xİ]™Sİ]][ÙHOHİ]][ÙNİ\İÛJHÂˆYˆ
+T™XY[YÙ\Š
+œÙXİ[Û‹™˜Z[\™KXÚ[˜ÙK\\˜Ù[‹Lˆ\İ[˜][Û‹œ[™\Ë™˜Z[\™PÚ[˜ÙT\˜Ù[\œ›ÜŠJHÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆÛÛœİ]]ÊˆÛİ[›ÙHHÙXİ[Û‹O™Ù]
+›İ]]XÛİ[]ÙZYÚÈŠNÂˆYˆ
+Ûİ[›ÙHOH[ŠHÂˆÛÛœİ]]ÊˆÛİ[ÈHÛİ[›ÙKO˜\×İX›J
+NÂˆYˆ
+Ûİ[ÈOH[ŠHÂˆ\œ›ÜˆH[[X]K\ØÜ˜\\‹›İ]]XÛİ[]ÙZYÚÈ]\İ™HHX›HÂˆ™]\›ˆ˜[ÙNÂˆBˆYˆ
+T™XY[YÙ\Š
+˜Ûİ[Ë›Û™H‹Lˆ\İ[˜][Û‹œ[™\Ë›İ]]Ûİ[ÙZYÚÖÌK\œ›ÜŠBˆT™XY[YÙ\Š
+˜Ûİ[ËÛÈ‹Lˆ\İ[˜][Û‹œ[™\Ë›İ]]Ûİ[ÙZYÚÖÌWK\œ›ÜŠBˆT™XY[YÙ\Š
+˜Ûİ[Ë™YH‹Lˆ\İ[˜][Û‹œ[™\Ë›İ]]Ûİ[ÙZYÚÖÌ—K\œ›ÜŠJHÂˆ™]\›ˆ˜[ÙNÂˆBˆBˆÛÛœİİZ[Ì—İÛİ[ÙZYÚİ[H\İ[˜][Û‹œ[™\Ë›İ]]Ûİ[ÙZYÚÖÌBˆ
+È\İ[˜][Û‹œ[™\Ë›İ]]Ûİ[ÙZYÚÖÌWH
+È\İ[˜][Û‹œ[™\Ë›İ]]Ûİ[ÙZYÚÖÌ—NÂˆYˆ
+Ûİ[ÙZYÚİ[OHL
+HÂˆ\œ›ÜˆH›İ]]XÛİ[]ÙZYÚÈÛ™KÛË[™™YH]\İİ[HÈLÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆÛÛœİ]]Êˆ[™S›ÙHHÙXİ[Û‹O™Ù]
+œ[™K]ÙZYÚÈŠNÂˆYˆ
+[™S›ÙHOH[ŠHÂˆÛÛœİ]]Êˆ[™UÙZYÚÈH[™S›ÙKO˜\×İX›J
+NÂˆYˆ
+[™UÙZYÚÈOH[ŠHÂˆ\œ›ÜˆH[[X]K\ØÜ˜\\‹œ[™K]ÙZYÚÈ]\İ™HHX›HÂˆ™]\›ˆ˜[ÙNÂˆBˆ›Üˆ
+İœÚ^™Wİ[™^HÈ[™^[™S˜[Y\ËœÚ^™J
+NÈ
+ÊÚ[™^
+HÂˆYˆ
+T™XYÙZYÚ
+
+œ[™UÙZYÚË[™S˜[Y\ÖÚ[™^Kˆ\İ[˜][Û‹œ[™\Ëœ[™UÙZYÚÖÚ[™^K\œ›ÜŠJHÂˆ™]\›ˆ˜[ÙNÂˆBˆBˆBˆ›Üˆ
+ÛÛœİİX›HÙZYÚˆ\İ[˜][Û‹œ[™\Ëœ[™UÙZYÚÊHÂˆ\İ[˜][Û‹œ[™\Ëİ[[™UÙZYÚ
+ÏHÙZYÚÂˆBˆYˆ
+\İš\Ùš[š]J\İ[˜][Û‹œ[™\Ëİ[[™UÙZYÚ
+Bˆ\İ[˜][Û‹œ[™\Ëİ[[™UÙZYÚHŒ
+HÂˆ\œ›ÜˆH˜]X\İÛ™H[™HÙZYÚ]\İ™HÜ™X]\ˆ[ˆ™\›ÈÂˆ™]\›ˆ˜[ÙNÂˆBˆBˆYˆ
+\İ[˜][Û‹˜Xİ]™Sİ]][ÙHOHİ]][ÙN”[™\ÊHÂˆÛÛœİ]]Êˆİ\İÛS›ÙHHÙXİ[Û‹O™Ù]
+˜İ\İÛHŠNÂˆÛÛœİ]]Êˆİ\İÛHHİ\İÛS›ÙHOH[ˆÈ[ˆˆİ\İÛS›ÙKO˜\×İX›J
+NÂˆYˆ
+İ\İÛHOH[ŠHÂˆ\œ›ÜˆH[[X]K\ØÜ˜\\‹˜İ\İÛH]\İ™HHX›HÚ[ˆİ\İÛHÜˆ›İ[ÙH\ÈXİ]™HÂˆ™]\›ˆ˜[ÙNÂˆBˆYˆ
+T™XY[YÙ\Š
+˜İ\İÛK™˜Z[\™KXÚ[˜ÙK\\˜Ù[‹Lˆ\İ[˜][Û‹˜İ\İÛK™˜Z[\™PÚ[˜ÙT\˜Ù[\œ›ÜŠBˆT™XYİ\İÛR][S]™[
+
+˜İ\İÛK\İ[˜][Û‹˜İ\İÛK\œ›ÜŠJHÂˆ™]\›ˆ˜[ÙNÂˆBˆÛÛœİ]]ÊˆÛİ[›ÙHHİ\İÛKO™Ù]
+›İ]]XÛİ[]ÙZYÚÈŠNÂˆYˆ
+Ûİ[›ÙHOH[ŠHÂˆÛÛœİ]]ÊˆÛİ[ÈHÛİ[›ÙKO˜\×İX›J
+NÂˆYˆ
+Ûİ[ÈOH[ŠHÂˆ\œ›ÜˆH[[X]K\ØÜ˜\\‹˜İ\İÛK›İ]]XÛİ[]ÙZYÚÈ]\İ™HHX›HÂˆ™]\›ˆ˜[ÙNÂˆBˆÛÛœİ^ˆİ˜\œ˜^Oİœİš[™×İšY]ËX^[][Pİ\İÛT˜[™ÛSİ]]ÏˆÛİ[˜[Y\ŞÂˆ›Û™H‹ÛÈ‹™YH‹™›İ\ˆ‹™š]™H‹œÚ^‹ˆœÙ]™[ˆ‹™ZYÚ‹›š[™H‹[ˆ‹™[]™[ˆ‹Ù[™H‹ˆNÂˆ›Üˆ
+İœÚ^™Wİ[™^HÈ[™^Ûİ[˜[Y\ËœÚ^™J
+NÈ
+ÊÚ[™^
+HÂˆYˆ
+T™XY[YÙ\Š
+˜Ûİ[ËÛİ[˜[Y\ÖÚ[™^KLˆ\İ[˜][Û‹˜İ\İÛK›İ]]Ûİ[ÙZYÚÖÚ[™^K\œ›ÜŠJHÂˆ™]\›ˆ˜[ÙNÂˆBˆBˆH[ÙHYˆ
+İ\İÛKO™Ù]
+›İ]]XÛİ[ŠHOH[ŠHÂˆİZ[Ì—İYØXŞSİ]]Ûİ[ßNÂˆYˆ
+T™XY[YÙ\Š
+˜İ\İÛK›İ]]XÛİ[‹KˆX^[][Pİ\İÛT˜[™ÛSİ]]ËYØXŞSİ]]Ûİ[\œ›ÜŠJHÂˆ\œ›ÜˆH›YØXŞHİ\İÛHİ]]XÛİ[]\İ™Hœ›ÛHH›İYÚLÈ™\XÙH]Ú]İ]]XÛİ[]ÙZYÚÈÂˆ™]\›ˆ˜[ÙNÂˆBˆ\İ[˜][Û‹˜İ\İÛK›İ]]Ûİ[ÙZYÚË™š[
+
+NÂˆ\İ[˜][Û‹˜İ\İÛK›İ]]Ûİ[ÙZYÚÖÛYØXŞSİ]]Ûİ[HWHHLÂˆBˆİZ[Ì—İİ\İÛPÛİ[ÙZYÚİ[ßNÂˆ›Üˆ
+ÛÛœİİZ[Ì—İÙZYÚˆ\İ[˜][Û‹˜İ\İÛK›İ]]Ûİ[ÙZYÚÊHÂˆİ\İÛPÛİ[ÙZYÚİ[
+ÏHÙZYÚÂˆBˆYˆ
+İ\İÛPÛİ[ÙZYÚİ[OHL
+HÂˆ\œ›ÜˆH˜İ\İÛHİ]]XÛİ[]ÙZYÚÈÛ™H›İYÚÙ[™H]\İİ[HÈLÂˆ™]\›ˆ˜[ÙNÂˆBˆÛÛœİ]]Êˆ][\Ó›ÙHHİ\İÛKO™Ù]
+š][\ÈŠNÂˆÛÛœİ]]Êˆ][\ÈH][\Ó›ÙHOH[ˆÈ[ˆˆ][\Ó›ÙKO˜\×Ø\œ˜^J
+NÂˆYˆ
+][\ÈOH[ˆ][\ËO™[\J
+JHÂˆ\œ›ÜˆH[[X]K\ØÜ˜\\‹˜İ\İÛKš][\È]\İÛÛZ[ˆ]X\İÛ™H][H[HÂˆ™]\›ˆ˜[ÙNÂˆBˆYˆ
+][\ËOœÚ^™J
+Hˆ\İ[˜][Û‹˜İ\İÛKš][\ËœÚ^™J
+JHÂˆ\œ›ÜˆH[[X]K\ØÜ˜\\‹˜İ\İÛKš][\ÈX^HÛÛZ[ˆ][Üİ[šY\ÈÂˆ™]\›ˆ˜[ÙNÂˆBˆ›Üˆ
+ÛÛœİ]]Éˆ][S›ÙHˆ
+š][\ÊHÂˆÛÛœİ]]Êˆ][HH][S›ÙK˜\×İX›J
+NÂˆYˆ
+][HOH[ŠHÂˆ\œ›ÜˆH™XXÚ[[X]K\ØÜ˜\\‹˜İ\İÛKš][\È[H]\İ™HHX›HÂˆ™]\›ˆ˜[ÙNÂˆBˆÛÛœİ]]ÊˆÛÙS›ÙHH][KO™Ù]
+˜ÛÙHŠNÂˆÛÛœİ]]ÈÛÙU^HÛÙS›ÙHOH[‚ˆÈİ›Ü[Û˜[İœİš[™ÏßBˆˆÛÙS›ÙKO˜[YOİœİš[™ÏŠ
+NÂˆYˆ
+XÛÙU^ÛÙU^O™[\J
+BˆÛÙU^OœÚ^™J
+HˆX^[][Pİ\İÛSİ]]ÛÙS[™İ
+HÂˆ\œ›ÜˆH™XXÚİ\İÛH][HÛÙH]\İ™HHÛ™KHÈ›İ\‹XÚ\˜Xİ\ˆˆ][HÛÙHÜˆHİ\ÜYÙ[KÜ[™HÙ[XİÜˆÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆİ\İÛSİ]][Iˆ[HH\İ[˜][Û‹˜İ\İÛKš][\ÖÙ\İ[˜][Û‹˜İ\İÛKš][PÛİ[NÂˆYˆ
+T\œÙPİ\İÛSİ]]ÛÙJ
+˜ÛÙU^[K\œ›ÜŠJH™]\›ˆ˜[ÙNÂ‚ˆÛÛœİ]]Êˆ]X[]S›ÙHH][KO™Ù]
+œ]X[]HŠNÂˆÛÛœİ]]È]X[]U^H]X[]S›ÙHOH[‚ˆÈİ›Ü[Û˜[İœİš[™ÏßBˆˆ]X[]S›ÙKO˜[YOİœİš[™ÏŠ
+NÂˆYˆ
+]X[]S›ÙHOH[ˆ	‰ˆ\]X[]U^
+HÂˆ\œ›ÜˆH˜İ\İÛH][H]X[]H]\İ™HHİš[™È
+Üˆ›[šÊHÂˆ™]\›ˆ˜[ÙNÂˆBˆÛÛœİ›ÛÛ˜[™ÛT]X[]HH]X[]S›ÙHOH[ˆ]X[]U^O™[\J
+NÂˆİ˜\œ˜^O”“’][\Î”]X[]KX^[][R][T]X[]Y\Ïˆ]X[]Y\ŞßNÂˆİœÚ^™Wİ]X[]PÛİ[ßNÂˆYˆ
+\˜[™ÛT]X[]JHÂˆİœİš[™×İšY]È]X[]S\İ
+
+œ]X[]U^
+NÂˆİœÚ^™WİÚÙ[”İ\ßNÂˆ›Üˆ
+ÎÊHÂˆÛÛœİİœÚ^™WİÛÛ[XHH]X[]S\İ™š[™
+	Ë	ËÚÙ[”İ\
+NÂˆÛÛœİİœİš[™×İšY]ÈÚÙ[ˆHš[R[œ]^
+ˆ]X[]S\İœİXœİŠÚÙ[”İ\ˆÛÛ[XHOHİœİš[™×İšY]Î›œÜÂˆÈ]X[]S\İœÚ^™J
+HHÚÙ[”İ\ˆˆÛÛ[XHHÚÙ[”İ\
+JNÂˆ”“’][\Î”]X[]H\œÙY]X[]^ßNÂˆYˆ
+ÚÙ[‹™[\J
+H]X[]PÛİ[H]X[]Y\ËœÚ^™J
+BˆT\œÙR][T]X[]JÚÙ[‹\œÙY]X[]JJHÂˆ\œ›ÜˆH˜İ\İÛH]X[]H]\İ™H›[šÈÜˆHÛÛ[XK\Ù\\˜]Y\İÙˆ[™™\š[Ü‹›Ü›X[İ\\š[Ü‹XYÚXËÙ]˜\™K[š\]YKÜˆÜ˜YYÂˆ™]\›ˆ˜[ÙNÂˆBˆYˆ
+İ™š[™
+]X[]Y\Ë˜™YÚ[Š
+Kˆ]X[]Y\Ë˜™YÚ[Š
+H
+Èİ]X×ØØ\İİœ™Y™—İŠ]X[]PÛİ[
+Kˆ\œÙY]X[]JHOH]X[]Y\Ë˜™YÚ[Š
+Bˆ
+Èİ]X×ØØ\İİœ™Y™—İŠ]X[]PÛİ[
+JHÂˆ\œ›ÜˆH˜İ\İÛH]X[]H\İÈX^H›İ™\X]H]X[]HÂˆ™]\›ˆ˜[ÙNÂˆBˆ]X[]Y\ÖÜ]X[]PÛİ[
+Ê×HH\œÙY]X[]NÂˆYˆ
+ÛÛ[XHOHİœİš[™×İšY]Î›œÜÊHœ™XZÎÂˆÚÙ[”İ\HÛÛ[XH
+ÈNÂˆBˆB‚ˆ[Kœ]X[]Y\ÈH]X[]Y\ÎÂˆ[Kœ]X[]PÛİ[H]X[]PÛİ[Âˆ[Kœ˜[™ÛT]X[]HH˜[™ÛT]X[]NÂˆYˆ
+ÛÛœİ]]ÊˆİX\˜[YY›ÙHH][KO™Ù]
+™İX\˜[YYŠJHÂˆÛÛœİ]]ÈİX\˜[YYHİX\˜[YY›ÙKO˜[YO›ÛÛŠ
+NÂˆYˆ
+YİX\˜[YY
+HÂˆ\œ›ÜˆH˜İ\İÛH][HİX\˜[YY]\İ™HYHÜˆ˜[ÙHÂˆ™]\›ˆ˜[ÙNÂˆBˆ[K™İX\˜[YYH
+™İX\˜[YYÂˆBˆYˆ
+T™XY[YÙ\Š
+š][Kœ]X[]H‹KL[Kœ]X[]K\œ›ÜŠBˆT™XYÙZYÚ
+
+š][KÙZYÚ‹[KÙZYÚ\œ›ÜŠJHÂˆ™]\›ˆ˜[ÙNÂˆBˆYˆ
+[K™İX\˜[YY
+HÂˆ
+ÊÙ\İ[˜][Û‹˜İ\İÛK™İX\˜[YYÛİ[ÂˆH[ÙHÂˆ\İ[˜][Û‹˜İ\İÛKİ[ÙZYÚ
+ÏH[KÙZYÚÂˆBˆ
+ÊÙ\İ[˜][Û‹˜İ\İÛKš][PÛİ[ÂˆBˆYˆ
+\İš\Ùš[š]J\İ[˜][Û‹˜İ\İÛKİ[ÙZYÚ
+Bˆ\İ[˜][Û‹˜İ\İÛKİ[ÙZYÚHŒ
+HÂˆ\œ›ÜˆH˜]X\İÛ™H›Û‹YİX\˜[YYİ\İÛH][HÙZYÚ]\İ™HÜ™X]\ˆ[ˆ™\›ÈÂˆ™]\›ˆ˜[ÙNÂˆBˆİœÚ^™WİX^[][T˜[™ÛSİ]]Ûİ[ßNÂˆ›Üˆ
+İœÚ^™Wİ[™^HÂˆ[™^\İ[˜][Û‹˜İ\İÛK›İ]]Ûİ[ÙZYÚËœÚ^™J
+NÈ
+ÊÚ[™^
+HÂˆYˆ
+\İ[˜][Û‹˜İ\İÛK›İ]]Ûİ[ÙZYÚÖÚ[™^Hˆ
+HÂˆX^[][T˜[™ÛSİ]]Ûİ[H[™^
+ÈNÂˆBˆBˆYˆ
+\İ[˜][Û‹˜İ\İÛK™İX\˜[YYÛİ[
+ÈX^[][T˜[™ÛSİ]]Ûİ[ˆˆX^[][Pİ\İÛSİ]]ÊHÂˆ\œ›ÜˆH™İX\˜[YYİ\İÛHİ]]È\ÈHX^[][H˜[™ÛHİ]]Ûİ[X^H›İ^ÙYY][\ÈÂˆ™]\›ˆ˜[ÙNÂˆBˆBˆ™]\›ˆYNÂˆHØ]Ú
+ÛÛœİİ™^Ù\[Û‰ˆ^Ù\[ÛŠHÂˆ\œ›ÜˆH^Ù\[Û‹Ú]
+
+NÂˆ™]\›ˆ˜[ÙNÂˆBŸB‚˜]]ÈØYÛÛ™šYÊ
+H›Ù^Ù\Oˆ›ÛÛÂˆ\T[T™\]Y\İYH˜[ÙNÂˆİœİš[™ÈÛÛ™šYÔİÜ˜YÙNÂˆİœİš[™×İšY]È^HY˜][ÛÛ™šYÎÂˆHÂˆÛÛœİ]]È]HÛÛ™šYÔ]
+
+NÂˆYˆ
+\]™[\J
+JHÂˆİ™\œ›Ü—ØÛÙH\œ›ÜÂˆYˆ
+\İ™š[\Ş\İ[N™^\İÊ]\œ›ÜŠH	‰ˆY\œ›ÜŠHÂˆİ™š[\Ş\İ[N˜Ü™X]WÙ\™XİÜšY\Ê]œ\™[Ü]
+
+K\œ›ÜŠNÂˆYˆ
+Y\œ›ÜŠHÂˆİ›Ùœİ™X[Hİ]]
+]İš[ÜÎ˜š[˜\JNÂˆYˆ
+İ]]š\×ÛÜ[Š
+JHÂˆİ]]Üš]JY˜][ÛÛ™šYËˆİ]X×ØØ\İİœİ™X[\Ú^™OŠÚ^™[ÙŠY˜][ÛÛ™šYÊHHJJNÂˆBˆBˆBˆ\œ›Ü‹˜ÛX\Š
+NÂˆYˆ
+İ™š[\Ş\İ[Nš\×Ü™Yİ[\—Ùš[J]\œ›ÜŠH	‰ˆY\œ›ÜŠHÂˆİšYœİ™X[H[œ]
+]İš[ÜÎ˜š[˜\JNÂˆYˆ
+[œ]š\×ÛÜ[Š
+JHÂˆÛÛ™šYÔİÜ˜YÙK˜\ÜÚYÛŠİš\İ™X[XY—Ú]\˜]ÜÚ\Š[œ]
+Kˆİš\İ™X[XY—Ú]\˜]ÜÚ\Š
+JNÂˆYˆ
+Z[œ]˜˜Y
+
+JH^HÛÛ™šYÔİÜ˜YÙNÂˆH[ÙHÂˆÛÛ^O“ÙÕØ\›Š•[[X]TØÜ˜\\ˆÛÛ™šYÈÛİ[›İ™HÜ[™YÈ[X™YYY˜][ÈÚ[™H\ÙYˆŠNÂˆBˆBˆBˆHØ]Ú
+‹‹ŠHÂˆÛÛ^O“ÙÕØ\›Š•[[X]TØÜ˜\\ˆÛÛ™šYÈXØÙ\ÜÈ˜Z[YÈ[X™YYY˜][ÈÚ[™H\ÙYˆŠNÂˆB‚ˆÙ][™ÜÈ\œÙYÂˆİœİš[™È\œ›ÜÂˆYˆ
+T\œÙPÛÛ™šYÊ^\œÙY\œ›ÜŠJHÂˆÛÛœİİœİš[™ÈY\ÜØYÙHH•[[X]TØÜ˜\\ˆ[˜[YÓSÛÛ™šYÈ
+ˆ
+È\œ›Üˆ
+ÈŠKˆÂˆÛÛ^O“ÙÑ\œ›ÜŠY\ÜØYÙK˜×ÜİŠ
+JNÂˆ™]\›ˆ˜[ÙNÂˆBˆÛÛ™šYÈH\œÙYÂˆYˆ
+PÛÛ™šYËš[œ]˜[Y
+HÂˆÛÛ^O“ÙÕØ\›Š•[[X]TØÜ˜\\ˆİ\İÛH[œ][\È\™H[˜[YÈ›ÈİX™H[œ]ÈÚ[™HXØÙ\YˆÚXÚÈ]]™\H™XÚ\HÛÛZ[œÈH›İYÚLˆ˜[Y[šY\ËˆŠNÂˆYˆ
+\T[T™\]Y\İY	‰ˆR][U\Q]K˜]˜Z[X›JHÂˆÛÛ^O“ÙÕØ\›Š•[[X]TØÜ˜\\ˆ][]\H[\È™\]Z\™H][]\\Ë\›[Ü‹ÙX\ÛœË[™Z\ØË[ˆHXİ]™H[Ù	ÜÈ]KÙÛØ˜[Ù^Ù[›Û\ˆÜˆ]Èœ›ØY\‹Ù]KØÛÛ\[\‹ÌËŒËŒÙ]KÙÛØ˜[Ù^Ù[˜[˜XÚËˆŠNÂˆBˆH[ÙHYˆ
+ÛÛ™šYËš[œ]\Ú[™ÑY˜][[\ÊHÂˆÛÛ^O“ÙÒ[™›Ê•[[X]TØÜ˜\\ˆ›Èİ\İÛH[œ]\İØ\È›İ[™ÈY˜][[™ÈÈ^XİHÛ™H[š\]YHÜˆÙ]][H[ˆHİX™KˆŠNÂˆBˆ™]\›ˆYNÂŸB‚›ÚY™\Ù][™[™Ê
+H›Ù^Ù\Âˆ[™[™ÈHßNÂˆ^Ú[™ÙT[™[™ËœİÜ™J˜[ÙKİ›Y[[ÜWÛÜ™\—Ü™[X\ÙJNÂŸB‚›ÚY×ØÙXÛ^Xİ]Q^Ú[™ÙJÛÛœİ”“”YÚ[ÛÛ^
+ˆÛÛ^›ÚY
+ŠH›Ù^Ù\ÂˆÛÛœİİ›ØÚ×ÙİX\™İ›]]^ˆØÚÊ[™[™Ó]]^
+NÂˆYˆ
+ÛÛ^OH[ˆÛÛ^OHÛÛ^PXİ]™K›ØY
+İ›Y[[ÜWÛÜ™\—ØXÜ]Z\™JJHÂˆ™\Ù][™[™Ê
+NÂˆ™]\›ÂˆB‚ˆİX™PÛÛXİÜˆİX™NÂˆÛÛœİ]]È[™[ÜT™\İ[H™XYİX™R][\Ê[™[™Ëœ^Y\‹İX™JNÂˆYˆ
+[™[ÜT™\İ[OH”“’[™[ÜN”™\İ[”İXØÙ\ÜÊHÂˆÚ\ˆY\ÜØYÙVÌM^ßNÂˆ
+›ÚY
+\İœÛœš[ŠY\ÜØYÙKÚ^™[ÙŠY\ÜØYÙJKˆ•[[X]TØÜ˜\\ˆÛİ[›İ™K\™XYİX™HÛÛ[ÈÛˆHØ[YH™XY
+[™[ÜH™\İ[I]JKˆ‹ˆİ]X×ØØ\İ[œÚYÛ™YŠ[™[ÜT™\İ[
+JNÂˆÛÛ^O“ÙÕØ\›ŠY\ÜØYÙJNÂˆ™\Ù][™[™Ê
+NÂˆ™]\›ÂˆBˆYˆ
+SX]Ú\Ô[™[™ÊİX™K[™[™ÊJHÂˆÚ\ˆY\ÜØYÙVÌMŒ^ßNÂˆ
+›ÚY
+\İœÛœš[ŠY\ÜØYÙKÚ^™[ÙŠY\ÜØYÙJKˆ•[[X]TØÜ˜\\ˆİX™HÛÛ[ÈÜˆ[ˆ[œ]][HÚ[™ÙY™Y›Ü™HH˜[œØXİ[Ûˆ
+	]H][JÊK	]H^XİY
+NÈ›È][\ÈÙ\™HÚ[™ÙYˆ‹ˆİ]X×ØØ\İ[œÚYÛ™YŠİX™K˜Ûİ[
+Kˆİ]X×ØØ\İ[œÚYÛ™YŠ[™[™Ëš][PÛİ[
+JNÂˆÛÛ^O“ÙÕØ\›ŠY\ÜØYÙJNÂˆ™\Ù][™[™Ê
+NÂˆ™]\›ÂˆBˆ›Üˆ
+İœÚ^™Wİ[™^HÈ[™^İX™K˜Ûİ[È
+ÊÚ[™^
+HÂˆYˆ
+İX™Kš][\ÖÚ[™^Kš[™HOH”“’[˜[Y][R[™JHÂˆÛÛ^O“ÙÕØ\›Š•[[X]TØÜ˜\\ˆ[ˆ[œ]][HÚ[™ÙY™Y›Ü™HH˜[œØXİ[ÛÈ›È][\ÈÙ\™HÚ[™ÙYˆŠNÂˆ™\Ù][™[™Ê
+NÂˆ™]\›ÂˆBˆB‚ˆİ˜\œ˜^O”“’][\Î•˜[œØXİ[Û’[œ]X^[][PİX™R][\Ïˆ[œ]ŞßNÂˆ›Üˆ
+İœÚ^™Wİ[™^HÈ[™^İX™K˜Ûİ[È
+ÊÚ[™^
+HÂˆ[œ]ÖÚ[™^HHÂˆš][HHİX™Kš][\ÖÚ[™^Kš[™Kˆœ]X[]HHİ]X×ØØ\İİZ[Ì—İŠˆİ›X^
+İX™Kš][\ÖÚ[™^Kœ]X[]KJJKˆœÛØÚÙ]Y][TÛXŞHH”“’][\Î”ÛØÚÙ]Y][TÛXŞN‘\İ›ŞPÛÛ[ËˆNÂˆBˆİ˜\œ˜^O”“’][\Î’][PÜ™X]TÜXËX^[][Pİ\İÛSİ]]Ïˆİ]]ŞßNÂˆİ˜\œ˜^O”“’][R[™KX^[][Pİ\İÛSİ]]Ïˆİ]]][\ŞßNÂˆ”“’][\Î•˜[œØXİ[Ûˆ˜[œØXİ[ÛÂˆœİXİÚ^™HH”“’][\Î•˜[œØXİ[Û”Ú^™Kˆ™›YÜÈHˆœ^Y\ˆH[™[™Ëœ^Y\‹ˆš[œ]Ûİ[Hİ]X×ØØ\İİZ[Ì—İŠİX™K˜Ûİ[
+Kˆ›İ]]Ûİ[Hˆš[œ]ÈH[œ]Ë™]J
+Kˆ›İ]]ÈHİ]]Ë™]J
+Kˆ›İ]]][\ÈHİ]]][\Ë™]J
+Kˆ›İ]]Ø\XÚ]HHX^[][Pİ\İÛSİ]]Ëˆœ™\Ù\™YHˆNÂˆ”“’][\Î•˜[œØXİ[Û”™\İ[™\İ[ÂˆœİXİÚ^™HH”“’][\Î•˜[œØXİ[Û”™\İ[Ú^™Kˆ™›YÜÈHˆ›İ]]Ûİ[Hˆœ™\Ù\™YHˆNÂ‚ˆÛÛœİ›ÛÛ›ØÙ\ÜÒ[™]šYX[HH[™[™Ëœ›ØÙ\ÜÒ[™]šYX[NÂˆÛÛœİİ]][ÙH™XÚ\Sİ]][ÙHH›ØÙ\ÜÒ[™]šYX[BˆÈİ]][ÙN”[™\ÈˆÚÛÜÙSİ]][ÙJ
+NÂˆİœÚ^™Wİİ]]Ûİ[ßNÂˆİZ[Ì—İ˜Z[Y[œ]Ûİ[ßNÂˆİZ[Ì—İİXØÙ\ÜÙ[[œ]Ûİ[ßNÂˆÛÛœİİZ[Ì—İ][\Ûİ[H›ØÙ\ÜÒ[™]šYX[BˆÈİ]X×ØØ\İİZ[Ì—İŠİX™K˜Ûİ[
+HˆUNÂˆ›ÛÛİ]]Ø\XÚ]Q^ÙYYYßNÂˆ›Üˆ
+İZ[Ì—İ][\HÈ][\][\Ûİ[È
+ÊØ][\
+HÂˆÛÛœİİ]][ÙHİ]][ÙHH›ØÙ\ÜÒ[™]šYX[BˆÈÚÛÜÙSİ]][ÙJ
+Hˆ™XÚ\Sİ]][ÙNÂˆÛÛœİİZ[Ì—İ˜Z[\™PÚ[˜ÙHHİ]][ÙHOHİ]][ÙN”[™\ÂˆÈÛÛ™šYËœ[™\Ë™˜Z[\™PÚ[˜ÙT\˜Ù[ˆˆÛÛ™šYË˜İ\İÛK™˜Z[\™PÚ[˜ÙT\˜Ù[ÂˆÛÛœİİZ[Ì—İ˜Z[\™T›ÛBˆİ[šY›Ü›WÚ[Ù\İšX][ÛİZ[Ì—İŠKL
+J˜[™ÛQ[™Ú[™JNÂˆYˆ
+˜Z[\™T›ÛH˜Z[\™PÚ[˜ÙJHÂˆ
+ÊÙ˜Z[Y[œ]Ûİ[ÂˆÛÛ[YNÂˆBˆ
+ÊÜİXØÙ\ÜÙ[[œ]Ûİ[ÂˆYˆ
+P\[™İ]]Ñ›Ü“[ÙJİ]][ÙKİ]]Ëİ]]Ûİ[
+JHÂˆİ]]Ø\XÚ]Q^ÙYYYHYNÂˆœ™XZÎÂˆBˆB‚ˆYˆ
+İ]]Ø\XÚ]Q^ÙYYY
+HÂˆÛÛ^O“ÙÕØ\›Š•[[X]TØÜ˜\\ˆ\È˜]ÚÛİ[^ÙYY][TÙ\šXÙIÜÈİ]][Z]È›È[œ]][\ÈÙ\™HÚ[™ÙYˆŠNÂˆ™\Ù][™[™Ê
+NÂˆ™]\›ÂˆB‚ˆ˜[œØXİ[Û‹›İ]]Ûİ[Hİ]X×ØØ\İİZ[Ì—İŠİ]]Ûİ[
+NÂ‚ˆÛÛœİ]]Èİ]\ÈH][TÙ\šXÙKO™^Xİ]U˜[œØXİ[ÛŠÛÛ^	˜[œØXİ[Û‹	œ™\İ[
+NÂˆYˆ
+İ]\ÈOH”“’][\Î”™\İ[”İXØÙ\ÜÊHÂˆÚ\ˆY\ÜØYÙVÌNL—^ßNÂˆYˆ
+›ØÙ\ÜÒ[™]šYX[JHÂˆ
+›ÚY
+\İœÛœš[ŠY\ÜØYÙKÚ^™[ÙŠY\ÜØYÙJKˆ•[[X]TØÜ˜\\ˆ˜]Ú›ØÙ\ÜÙY	]H[œ]][JÊH[™\[™[Nˆ	]H˜Z[Y	]HİXØÙYYY	]Hİ]]][JÊHÜ™X]Yˆ‹ˆİ]X×ØØ\İ[œÚYÛ™YŠİX™K˜Ûİ[
+K˜Z[Y[œ]Ûİ[ˆİXØÙ\ÜÙ[[œ]Ûİ[İ]X×ØØ\İ[œÚYÛ™YŠİ]]Ûİ[
+JNÂˆH[ÙHYˆ
+˜Z[Y[œ]Ûİ[OH
+HÂˆÛÛœİİZ[Ì—İ˜Z[\™PÚ[˜ÙHH™XÚ\Sİ]][ÙHOHİ]][ÙN”[™\ÂˆÈÛÛ™šYËœ[™\Ë™˜Z[\™PÚ[˜ÙT\˜Ù[ˆˆÛÛ™šYË˜İ\İÛK™˜Z[\™PÚ[˜ÙT\˜Ù[Âˆ
+›ÚY
+\İœÛœš[ŠY\ÜØYÙKÚ^™[ÙŠY\ÜØYÙJKˆ•[[X]TØÜ˜\\ˆ™XÚ\H˜Z[Y
+	]IIHÚ[˜ÙJNÈ	]H[œ]][JÊH[™ÛØÚÙ]ÛÛ[ÈÙ\™HÛÛœİ[YYÚ]›Èİ]]ˆ‹ˆ˜Z[\™PÚ[˜ÙKİ]X×ØØ\İ[œÚYÛ™YŠİX™K˜Ûİ[
+JNÂˆH[ÙHYˆ
+™XÚ\Sİ]][ÙHOHİ]][ÙN”[™\ÊHÂˆ
+›ÚY
+\İœÛœš[ŠY\ÜØYÙKÚ^™[ÙŠY\ÜØYÙJKˆ•[[X]TØÜ˜\\ˆ˜[œÛ]]Y	]HÛÛ™šYİ\™Y[œ]][JÊH[È	]H˜[™ÛH[™JÊKˆ‹ˆİ]X×ØØ\İ[œÚYÛ™YŠİX™K˜Ûİ[
+Kİ]X×ØØ\İ[œÚYÛ™YŠİ]]Ûİ[
+JNÂˆH[ÙHÂˆ
+›ÚY
+\İœÛœš[ŠY\ÜØYÙKÚ^™[ÙŠY\ÜØYÙJKˆ•[[X]TØÜ˜\\ˆ˜[œÛ]]Y	]HÛÛ™šYİ\™Y[œ]][JÊH[È	]Hİ\İÛH][JÊKˆ‹ˆİ]X×ØØ\İ[œÚYÛ™YŠİX™K˜Ûİ[
+Kİ]X×ØØ\İ[œÚYÛ™YŠİ]]Ûİ[
+JNÂˆBˆÛÛ^O“ÙÒ[™›ÊY\ÜØYÙJNÂˆYˆ
+™\İ[›İ]]Ûİ[OH˜[œØXİ[Û‹›İ]]Ûİ[
+HÂˆÛÛ^O“ÙÕØ\›Š•[[X]TØÜ˜\\ˆ][TÙ\šXÙHÛÛ[Z]YH˜[œØXİ[Ûˆ]™\ÜY[ˆ[™^XİYİ]]Ûİ[ˆŠNÂˆBˆH[ÙHÂˆÚ\ˆY\ÜØYÙVÌMÍ—^ßNÂˆ
+›ÚY
+\İœÛœš[ŠY\ÜØYÙKÚ^™[ÙŠY\ÜØYÙJKˆ•[[X]TØÜ˜\\ˆ˜[œØXİ[Ûˆ›ÛY˜XÚÈ
+][TÙ\šXÙH™\İ[I]JNÈH[œ]][JÊHÙ\™HY[İXÚYˆ‹ˆİ]X×ØØ\İ[œÚYÛ™YŠİ]\ÊJNÂˆÛÛ^O“ÙÕØ\›ŠY\ÜØYÙJNÂˆBˆ™\Ù][™[™Ê
+NÂŸB‚˜]]È×ØÙXÛÛ•ZSY\ÜØYÙJÛÛœİ”“”YÚ[ÛÛ^
+ˆÛÛ^ˆÛÛœİ”“”Ú\™Y]™[Î•ZSY\ÜØYÙQ]™[
+ˆ]™[›ÚY
+ŠH›Ù^Ù\ˆOˆ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛˆÂˆYˆ
+ÛÛ^OHÛÛ^]™[OH[‚ˆ]™[OœİXİÚ^™H”“”Ú\™Y]™[Î•ZSY\ÜØYÙQ]™[™\]Z\™YÚ^™Bˆ]™[O\™Ù]OH[ˆ]™[O˜ÛÛ[X[™OH[‚ˆPXİ]™K›ØY
+İ›Y[[ÜWÛÜ™\—ØXÜ]Z\™JJHÂˆ™]\›ˆ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛ[YNÂˆB‚ˆÛÛœİİœİš[™×İšY]È\™Ù]
+]™[O\™Ù]
+NÂˆÛÛœİİœİš[™×İšY]ÈÛÛ[X[™
+]™[O˜ÛÛ[X[™
+NÂˆÛÛœİİœİš[™×İšY]È^H]™[O^OH[‚ˆÈİœİš[™×İšY]Ê]™[O^
+Hˆİœİš[™×İšY]ŞßNÂˆÛÛœİ›ÛÛ\ĞİX™SÜ”İ\Ú\™Ù]H\™Ù]OHÛÛ™\\™Ù]ˆ\™Ù]OHİ\ÚÛÛ™\\™Ù]ÂˆÛÛœİ›ÛÛ˜]ÚÙÙÛPXİ[ÛˆH\ĞİX™SÜ”İ\Ú\™Ù]ˆ	‰ˆÛÛ[X[™OHÛÛ™\ÛÛ[X[™	‰ˆ^OH˜]ÚÙÙÛSX\šÙ\ÂˆYˆ
+˜]ÚÙÙÛPXİ[ÛŠHÂˆYˆ
+ÛÛ™šYË˜˜]ÚØÜ˜\[Ø^\ÓÛŠHÂˆ˜]Ú[ÙQ[˜X›YœİÜ™JYKİ›Y[[ÜWÛÜ™\—Ü™[X\ÙJNÂˆ™]\›ˆ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛœİ[YNÂˆBˆ›ÛÛİ\œ™[H˜]Ú[ÙQ[˜X›Y›ØY
+İ›Y[[ÜWÛÜ™\—ØXÜ]Z\™JNÂˆÚ[H
+P˜]Ú[ÙQ[˜X›Y˜ÛÛ\\™WÙ^Ú[™ÙWİÙXZÊİ\œ™[Xİ\œ™[ˆİ›Y[[ÜWÛÜ™\—ØXÜWÜ™[İ›Y[[ÜWÛÜ™\—ØXÜ]Z\™JJHÂˆBˆÛÛ^O“ÙÒ[™›Êİ\œ™[ˆÈ•[[X]TØÜ˜\\ˆ[™]šYX[˜]Ú›ØÙ\ÜÚ[™È\È\ØX›Yˆ‚ˆˆ•[[X]TØÜ˜\\ˆ[™]šYX[˜]Ú›ØÙ\ÜÚ[™È\È[˜X›YˆŠNÂˆ™]\›ˆ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛœİ[YNÂˆB‚ˆÛÛœİ›ÛÛYÚ[]ÛXİ[ÛˆH\ĞİX™SÜ”İ\Ú\™Ù]ˆ	‰ˆÛÛ[X[™OHÛÛ™\ÛÛ[X[™	‰ˆ^OHØÜ˜\\]Û“X\šÙ\ÂˆÛÛœİ›ÛÛ˜]]™PÛÛ™\Xİ[ÛˆH\ĞİX™SÜ”İ\Ú\™Ù]ˆ	‰ˆÛÛ[X[™OHÛÛ™\ÛÛ[X[™	‰ˆ\YÚ[]ÛXİ[ÛÂˆYˆ
+\YÚ[]ÛXİ[Ûˆ	‰ˆ[˜]]™PÛÛ™\Xİ[ÛŠHÂˆ™]\›ˆ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛ[YNÂˆB‚ˆÛÛœİ›ÛÛ˜]]™P]Û“[ÙHHÛÛ™šYË˜[œÛ]]P]Û“[ÙBˆOH˜[œÛ]]P]Û“[ÙN“˜]]™NÂˆYˆ
+˜]]™PÛÛ™\Xİ[Ûˆ	‰ˆ[˜]]™P]Û“[ÙJHÂˆYˆ
+PÛÛ™\Y\ÜØYÙSÙÙÙY™^Ú[™ÙJYKİ›Y[[ÜWÛÜ™\—ØXÜWÜ™[
+JHÂˆÛÛ^O“ÙÒ[™›Ê•[[X]TØÜ˜\\ˆØœÙ\™YH˜]]™HİX™HÜˆİ\ÚÛÛ™\Y\ÜØYÙNÈ\ÜÚ[™È]›İYÚˆŠNÂˆBˆ™]\›ˆ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛ[YNÂˆB‚ˆÛÛœİ›ÛÛ˜]]™Q˜[˜XÚÈH˜]]™P]Û“[ÙNÂˆYˆ
+YÚ[]ÛXİ[Û‚ˆ	‰ˆTØÜ˜\\]Û“Y\ÜØYÙSÙÙÙY™^Ú[™ÙJYKİ›Y[[ÜWÛÜ™\—ØXÜWÜ™[
+JHÂˆÛÛ^O“ÙÒ[™›Ê•[[X]TØÜ˜\\ˆØœÙ\™YHYÚ[ˆ˜[œÛ]]H]ÛˆXİ[Û‹ˆŠNÂˆBˆYˆ
+˜]]™PÛÛ™\Xİ[Û‚ˆ	‰ˆPÛÛ™\Y\ÜØYÙSÙÙÙY™^Ú[™ÙJYKİ›Y[[ÜWÛÜ™\—ØXÜWÜ™[
+JHÂˆÛÛ^O“ÙÒ[™›Ê•[[X]TØÜ˜\\ˆ˜]]™H]Ûˆ[ÙH\ÈÚXÚÚ[™ÈÛÛ™šYİ\™Y[œ]È™Y›Ü™H\ÜÚ[™È[›X]ÚY™XÚ\\ÈÈ”‹ˆŠNÂˆB‚ˆ”“”^Y\’[™H^Y\Ñ”“’[˜[Y^Y\’[™_NÂˆYˆ
+[™[ÜTÙ\šXÙKO™Ù]ØØ[^Y\ŠÛÛ^	œ^Y\ŠHOH”“’[™[ÜN”™\İ[”İXØÙ\ÜÂˆ^Y\ˆOH”“’[˜[Y^Y\’[™JHÂˆ™]\›ˆ˜]]™Q˜[˜XÚÈÈ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛ[YBˆˆ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛœİ[YNÂˆB‚ˆİX™PÛÛXİÜˆİX™NÂˆYˆ
+™XYİX™R][\Ê^Y\‹İX™JHOH”“’[™[ÜN”™\İ[”İXØÙ\ÜÊHÂˆYˆ
+SZ\ÛX]ÚY\ÜØYÙSÙÙÙY™^Ú[™ÙJYKİ›Y[[ÜWÛÜ™\—ØXÜWÜ™[
+JHÂˆÛÛ^O“ÙÕØ\›Š˜]]™Q˜[˜XÚÂˆÈ•[[X]TØÜ˜\\ˆÛİ[›İ™XYİX™HÛÛ[È[ˆ˜]]™H]Ûˆ[ÙNÈ\ÜÚ[™ÈHXİ[Ûˆ›İYÚÈ”‹ˆ‚ˆˆ•[[X]TØÜ˜\\ˆÛİ[›İ™XYİX™HÛÛ[ÎÈ˜[œÛ]]HXİ[ÛˆØ\È›ØÚÙYˆŠNÂˆBˆ™]\›ˆ˜]]™Q˜[˜XÚÈÈ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛ[YBˆˆ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛœİ[YNÂˆBˆÛÛœİ›ÛÛ˜]Ú[ÙT™\]Y\İYH˜]Ú[ÙQ[˜X›Y›ØY
+ˆİ›Y[[ÜWÛÜ™\—ØXÜ]Z\™JNÂˆ›ÛÛ›ØÙ\ÜÒ[™]šYX[^ßNÂˆYˆ
+SX]Ú\ĞÛÛ™šYİ\™Y[œ]ÊİX™K˜]Ú[ÙT™\]Y\İYˆ›ØÙ\ÜÒ[™]šYX[JJHÂˆYˆ
+SZ\ÛX]ÚY\ÜØYÙSÙÙÙY™^Ú[™ÙJYKİ›Y[[ÜWÛÜ™\—ØXÜWÜ™[
+JHÂˆÛÛ^O“ÙÒ[™›Ê˜]]™Q˜[˜XÚÂˆÈ•[[X]TØÜ˜\\ˆ›ÈÛÛ™šYİ\™Y[œ]™XÚ\HX]ÚYÈ\ÜÚ[™ÈHXİ[Ûˆ›İYÚÈ”‹ˆ‚ˆˆ•[[X]TØÜ˜\\ˆ›ÈÛÛ™šYİ\™Y[œ]™XÚ\HX]ÚYHİX™HÛÛ[ËˆŠNÂˆBˆ™]\›ˆ˜]]™Q˜[˜XÚÈÈ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛ[YBˆˆ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛœİ[YNÂˆBˆ›Üˆ
+İœÚ^™Wİ[™^HÈ[™^İX™K˜Ûİ[È
+ÊÚ[™^
+HÂˆYˆ
+İX™Kš][\ÖÚ[™^Kš[™HOH”“’[˜[Y][R[™JHÂˆ™]\›ˆ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛœİ[YNÂˆBˆBˆYˆ
+^Ú[™ÙT[™[™Ë™^Ú[™ÙJYKİ›Y[[ÜWÛÜ™\—ØXÜWÜ™[
+JHÂˆ™]\›ˆ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛœİ[YNÂˆBˆÂˆÛÛœİİ›ØÚ×ÙİX\™İ›]]^ˆØÚÊ[™[™Ó]]^
+NÂˆ[™[™ÈHßNÂˆ[™[™Ëœ^Y\ˆH^Y\Âˆ[™[™Ëš][PÛİ[HİX™K˜Ûİ[Âˆ[™[™Ë˜˜]Ú[ÙT™\]Y\İYH˜]Ú[ÙT™\]Y\İYÂˆ[™[™Ëœ›ØÙ\ÜÒ[™]šYX[HH›ØÙ\ÜÒ[™]šYX[NÂˆ›Üˆ
+İœÚ^™Wİ[™^HÈ[™^İX™K˜Ûİ[È
+ÊÚ[™^
+HÂˆ[™[™Ëš][\ÖÚ[™^HHİX™Kš][\ÖÚ[™^NÂˆBˆBˆYˆ
+™XYÙ\šXÙKOœ[“Û‘Ø[YU™XY
+ÛÛ^^Xİ]Q^Ú[™ÙK[ŠBˆOH”“•™XYÎ”™\İ[”İXØÙ\ÜÊHÂˆÛÛœİİ›ØÚ×ÙİX\™İ›]]^ˆØÚÊ[™[™Ó]]^
+NÂˆ™\Ù][™[™Ê
+NÂˆÛÛ^O“ÙÕØ\›Š•[[X]TØÜ˜\\ˆÛİ[›İØÚY[HH˜[œØXİ[ÛˆÛˆHØ[YH™XYˆŠNÂˆ™]\›ˆ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛœİ[YNÂˆBˆ™]\›ˆ”“”Ú\™Y]™[Î•ZSY\ÜØYÙPXİ[ÛÛÛœİ[YNÂŸB‚˜]]È[š]X[^™JÛÛœİ”“”YÚ[ÛÛ^
+ˆÛÛ^
+HOˆ›ÛÛÂˆ˜]Ú[ÙQ[˜X›YœİÜ™J˜[ÙKİ›Y[[ÜWÛÜ™\—Ü™[X\ÙJNÂˆYˆ
+ÛÛ^O”]Y\TÙ\šXÙJ	’[™[ÜTÙ\šXÙJBˆOH”“”Ù\šXÙT]Y\T™\İ[”İXØÙ\ÜÂˆ[™[ÜTÙ\šXÙHOH[‚ˆ[™[ÜTÙ\šXÙKOœÙ\šXÙTÚ^™H”“’[™[ÜTÙ\šXÙT™\]Z\™YÚ^™Bˆ[™[ÜTÙ\šXÙKO™Ù]ØØ[^Y\ˆOH[‚ˆ[™[ÜTÙ\šXÙKO™›Ü‘XXÚ[™[ÜR][HOH[ŠHÂˆÛÛ^O“ÙÑ\œ›ÜŠ•[[X]TØÜ˜\\ˆ”“ØY\ˆ[™[ÜTÙ\šXÙHŒH\È™\]Z\™YˆŠNÂˆ™]\›ˆ˜[ÙNÂˆBˆYˆ
+ÛÛ^O”]Y\TÙ\šXÙJ	’][TÙ\šXÙJBˆOH”“”Ù\šXÙT]Y\T™\İ[”İXØÙ\ÜÂˆ][TÙ\šXÙHOH[‚ˆ][TÙ\šXÙKOœÙ\šXÙTÚ^™H”“’][TÙ\šXÙT™\]Z\™YÚ^™Bˆ][TÙ\šXÙKO™\İ›ŞR][HOH[‚ˆ][TÙ\šXÙKO™^Xİ]U˜[œØXİ[ÛˆOH[ŠHÂˆÛÛ^O“ÙÑ\œ›ÜŠ•[[X]TØÜ˜\\ˆ”“ØY\ˆ][TÙ\šXÙHŒH˜[œØXİ[Ûˆİ\Ü\È™\]Z\™YˆŠNÂˆ™]\›ˆ˜[ÙNÂˆBˆYˆ
+ÛÛ^O”]Y\TÙ\šXÙJ	•™XYÙ\šXÙJBˆOH”“”Ù\šXÙT]Y\T™\İ[”İXØÙ\ÜÂˆ™XYÙ\šXÙHOH[‚ˆ™XYÙ\šXÙKOœÙ\šXÙTÚ^™H”“•™XYÙ\šXÙT™\]Z\™YÚ^™Bˆ™XYÙ\šXÙKOœ[“Û‘Ø[YU™XYOH[ŠHÂˆÛÛ^O“ÙÑ\œ›ÜŠ•[[X]TØÜ˜\\ˆ”“ØY\ˆØ[YK]™XYÙ\šXÙH\È™\]Z\™YˆŠNÂˆ™]\›ˆ˜[ÙNÂˆBˆYˆ
+ÛÛ^O”]Y\TÙ\šXÙJ	‘]™[Ù\šXÙJBˆOH”“”Ù\šXÙT]Y\T™\İ[”İXØÙ\ÜÂˆ]™[Ù\šXÙHOH[‚ˆ]™[Ù\šXÙKOœÙ\šXÙTÚ^™H”“”Ú\™Y]™[Ù\šXÙT™\]Z\™YÚ^™Bˆ]™[Ù\šXÙKOœ™YÚ\İ\•ZSY\ÜØYÙS\İ[™\ˆOH[‚ˆ]™[Ù\šXÙKO[œ™YÚ\İ\•ZSY\ÜØYÙS\İ[™\ˆOH[ŠHÂˆÛÛ^O“ÙÑ\œ›ÜŠ•[[X]TØÜ˜\\ˆ”“ØY\ˆÚ\™YRK[Y\ÜØYÙHÙ\šXÙH\È™\]Z\™YˆŠNÂˆ™]\›ˆ˜[ÙNÂˆBˆ›ÛÛ\ÙYÛÛ\[\‘˜[˜XÚŞßNÂˆ
+›ÚY
+SØY][U\PØ][ÙÊ\ÙYÛÛ\[\‘˜[˜XÚÊNÂˆYˆ
+\ÙYÛÛ\[\‘˜[˜XÚÊHÂˆÛÛ^O“ÙÒ[™›Ê•[[X]TØÜ˜\\ˆXİ]™H][HX›\È\™H[˜ÛÛ\]NÈ\Ú[™ÈH˜\ÙHX›\Èœ›ÛHœ›ØY\‹Ù]KØÛÛ\[\‹ÌËŒËŒÙ]KÙÛØ˜[Ù^Ù[ˆŠNÂˆBˆYˆ
+R][U\Q]K˜]˜Z[X›BˆR][U\Q]KšÛ›İÛ•\PÛÙ\Ë˜ÛÛZ[œÊ]Y\İ][U\PÛÙJJHÂˆÛÛ^O“ÙÕØ\›Š•[[X]TØÜ˜\\ˆ][HX›\È\™HZ\ÜÚ[™ÈÜˆÈ›İYš[™H	Ü]Y\ÉÎÈYÚ[ˆ™XÚ\\È\™H\ØX›YÈ™]™[]Y\İ][\Èœ›ÛH™Z[™ÈØÜ˜\YˆŠNÂˆBˆYˆ
+SØYÛÛ™šYÊ
+JH™]\›ˆ˜[ÙNÂˆ˜]Ú[ÙQ[˜X›YœİÜ™JÛÛ™šYË˜˜]ÚØÜ˜\[Ø^\ÓÛ‹ˆİ›Y[[ÜWÛÜ™\—Ü™[X\ÙJNÂˆ\P]Û“^[İ]
+
+NÂ‚ˆİZ[İÙYYHÙ]XÚĞÛİ[
+
+Bˆˆ
+İ]X×ØØ\İİZ[İŠÙ]İ\œ™[›ØÙ\ÜÒY
+
+JHÌ•JNÂˆHÂˆİœ˜[™ÛWÙ]šXÙH˜[™ÛNÂˆÙYYH
+İ]X×ØØ\İİZ[İŠ˜[™ÛJ
+JHÌ•JH˜[™ÛJ
+NÂˆHØ]Ú
+‹‹ŠHÂˆBˆ˜[™ÛQ[™Ú[™KœÙYY
+İ]X×ØØ\İİ›]NNLÍÎœ™\İ[İ\OŠÙYYˆ
+ÙYYˆÌ•JJJNÂ‚ˆÛÛœİ”“”Ú\™Y]™[Î•ZSY\ÜØYÙS\İ[™\ˆ\İ[™\ÂˆœİXİÚ^™HH”“”Ú\™Y]™[Î•ZSY\ÜØYÙS\İ[™\”Ú^™Kˆ™›YÜÈHˆœš[Üš]HHLˆœ™\Ù\™YHˆ˜Ø[˜XÚÈHÛ•ZSY\ÜØYÙKˆ\Ù\‘]HH[‹ˆNÂˆYˆ
+]™[Ù\šXÙKOœ™YÚ\İ\•ZSY\ÜØYÙS\İ[™\ŠÛÛ^	›\İ[™\‹	“Y\ÜØYÙR[™JBˆOH”“”Ú\™Y]™[Î”™\İ[”İXØÙ\ÜÂˆY\ÜØYÙR[™HOH”“”Ú\™Y]™[Î’[˜[Y[™JHÂˆÛÛ^O“ÙÑ\œ›ÜŠ•[[X]TØÜ˜\\ˆÛİ[›İ™YÚ\İ\ˆ›ÜˆHÜ˜YšXÈİX™HÛÛ™\Xİ[Û‹ˆŠNÂˆ™]\›ˆ˜[ÙNÂˆBˆXİ]™KœİÜ™JYKİ›Y[[ÜWÛÜ™\—Ü™[X\ÙJNÂˆYˆ
+ÛÛ™šYË˜Xİ]™Sİ]][ÙHOHİ]][ÙN”[™\ÊHÂˆÛÛ^O“ÙÒ[™›Ê•[[X]TØÜ˜\\ˆŒ‹\È™XYH[ˆ[™\È[ÙNÈÛÛ™šYİ\™Y[œ]][\È\™HXØÙ\YˆŠNÂˆH[ÙHYˆ
+ÛÛ™šYË˜Xİ]™Sİ]][ÙHOHİ]][ÙNİ\İÛJHÂˆÛÛ^O“ÙÒ[™›Ê•[[X]TØÜ˜\\ˆŒ‹\È™XYH[ˆİ\İÛH[ÙNÈÛÛ™šYİ\™Y[œ]][\È\™HXØÙ\YˆŠNÂˆH[ÙHÂˆÛÛ^O“ÙÒ[™›Ê•[[X]TØÜ˜\\ˆŒ‹\È™XYH[ˆ›İ[ÙNÈXXÚ˜[œÛ]]HÚÛÜÙ\È[™\ÈÜˆİ\İÛHÚ]\]X[›Ø˜Xš[]KˆŠNÂˆBˆYˆ
+ÛÛ™šYË˜[œÛ]]P]Û“[ÙHOH˜[œÛ]]P]Û“[ÙN“˜]]™JHÂˆÛÛ^O“ÙÒ[™›Ê•[[X]TØÜ˜\\ˆ˜]]™H]Ûˆ[ÙH\ÈXİ]™NÈÛÛ™šYİ\™YYÚ[ˆ™XÚ\\ÈZÙHš[Üš]HÛˆÛÛ™\[™[›X]ÚYÛÛ[È\ÜÈÈ”‹ˆŠNÂˆH[ÙHÂˆÛÛ^O“ÙÒ[™›Ê•[[X]TØÜ˜\\ˆÙ\\˜]H]Ûˆ[ÙH\ÈXİ]™NÈ˜]]™HÛÛ™\Y\ÜØYÙ\È\ÜÈ›İYÚ[™HX\šÙY]Ûˆ[œÈYÚ[ˆ™XÚ\\ËˆŠNÂˆBˆYˆ
+ÛÛ™šYË˜˜]ÚØÜ˜\[Ø^\ÓÛŠHÂˆÛÛ^O“ÙÒ[™›Ê•[[X]TØÜ˜\\ˆ˜]ÚØÜ˜\\È[Ø^\È[˜X›YÈ]ÈÚXÚØ›Ş[™X™[\™HÛZ]Yœ›ÛHHXİ]™H^[İ]ËˆŠNÂˆBˆ™]\›ˆYNÂŸB‚›ÚYÚ]İÛŠ
+H›Ù^Ù\ÂˆXİ]™KœİÜ™J˜[ÙKİ›Y[[ÜWÛÜ™\—Ü™[X\ÙJNÂˆYˆ
+ÛÛ^OH[ˆ	‰ˆ]™[Ù\šXÙHOH[‚ˆ	‰ˆY\ÜØYÙR[™HOH”“”Ú\™Y]™[Î’[˜[Y[™Bˆ	‰ˆ]™[Ù\šXÙKO[œ™YÚ\İ\•ZSY\ÜØYÙS\İ[™\ˆOH[ŠHÂˆ
+›ÚY
+Q]™[Ù\šXÙKO[œ™YÚ\İ\•ZSY\ÜØYÙS\İ[™\ŠÛÛ^Y\ÜØYÙR[™JNÂˆBˆY\ÜØYÙR[™HH”“”Ú\™Y]™[Î’[˜[Y[™NÂˆÛÛœİİ›ØÚ×ÙİX\™İ›]]^ˆØÚÊ[™[™Ó]]^
+NÂˆ™\Ù][™[™Ê
+NÂˆ˜[™ÛQ[™Ú[™KœÙYY
+
+NÂˆÛÛ™\Y\ÜØYÙSÙÙÙYœİÜ™J˜[ÙKİ›Y[[ÜWÛÜ™\—Ü™[X\ÙJNÂˆØÜ˜\\]Û“Y\ÜØYÙSÙÙÙYœİÜ™J˜[ÙKİ›Y[[ÜWÛÜ™\—Ü™[X\ÙJNÂˆZ\ÛX]ÚY\ÜØYÙSÙÙÙYœİÜ™J˜[ÙKİ›Y[[ÜWÛÜ™\—Ü™[X\ÙJNÂˆ][U\Q]HHßNÂˆ\T[T™\]Y\İYH˜[ÙNÂˆ]™[Ù\šXÙHH[Âˆ™XYÙ\šXÙHH[Âˆ][TÙ\šXÙHH[Âˆ[™[ÜTÙ\šXÙHH[ÂŸB‚ŸHËÈ˜[Y\ÜXÙB‚‘”“ÔQÒS—ÑVÔ•]]È”“ØY\‘Ù]YÚ[’[™›Ê
+H›Ù^Ù\OˆÛÛœİ”“”YÚ[’[™›ÊˆÂˆ™]\›ˆ	’[™›ÎÂŸB‚‘”“ÔQÒS—ÑVÔ•]]È”“ØY\“ØYYÚ[ŠÛÛœİ”“”YÚ[ÛÛ^
+ˆÛÛ^
+H›Ù^Ù\Oˆ›ÛÛÂˆÚ]İÛŠ
+NÂˆYˆ
+Q”“’\ĞÛÛ^
+ÛÛ^
+HÛÛ^O˜XšU™\œÚ[ÛˆOH”“ÔQÒS—ĞP’WÕ‘T”ÒSÓŠH™]\›ˆ˜[ÙNÂˆÛÛ^HÛÛ^Âˆ›ÛÛ[š]X[^™YßNÂˆHÂˆ[š]X[^™YH[š]X[^™JÛÛ^
+NÂˆHØ]Ú
+‹‹ŠHÂˆÛÛ^O“ÙÑ\œ›ÜŠ•[[X]TØÜ˜\\ˆYÚ[ˆ[š]X[^˜][Ûˆ˜Z[YˆŠNÂˆBˆYˆ
+Z[š]X[^™Y
+HÂˆÚ]İÛŠ
+NÂˆÛÛ^H[Âˆ™]\›ˆ˜[ÙNÂˆBˆ™]\›ˆYNÂŸB‚‘”“ÔQÒS—ÑVÔ•›ÚY”“ØY\•[›ØYYÚ[Š
+H›Ù^Ù\ÂˆÚ]İÛŠ
+NÂˆÛÛ^H[ÂŸB
