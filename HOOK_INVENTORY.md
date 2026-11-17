@@ -6,9 +6,9 @@
 |---|---|
 | Plugin name | Ultimate Scrapper |
 | Plugin ID | ultimate-scrapper |
-| Release version | Unreleased |
+| Release version | 1.2.4 |
 | Inventory updated | 2026-11-17 |
-| Source revision | 1.2.4 working tree, based on tag v0.2.4 |
+| Source revision | Tag v1.2.4 |
 | D2R build(s) audited | Not validated |
 | D2RLoader SDK / Plugin ABI | PluginSDK 0.4.0 / Plugin ABI 4 |
 | Audit status | Complete |

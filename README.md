@@ -196,7 +196,7 @@ Ultimate Scrapper requires an authoritative local game or TCP/IP host. Remote cl
 
 ## Install
 
-These steps describe the current source. If you're installing a published DLL, see the README for its version under [Releases](https://github.com/MadMike616/ultimate-scrapper/releases).
+Download the DLL from [GitHub Releases](https://github.com/MadMike616/ultimate-scrapper/releases). These instructions apply to v1.2.4 and later. The TOML settings are unchanged from v0.2.4, so you can keep your existing config when upgrading.
 
 1. Check the table below for the files your setup needs. Keep existing loose files in place. Use **Ladik's Casc Viewer** to extract any missing originals from the installed game into `mods/<ModName>/d2rloader/plugins/basefiles-and-backups/basefiles/`. Omit the leading **data/** from the extracted path: for example, put **data/global/excel/itemtypes.txt** in **basefiles/global/excel/itemtypes.txt**.
 2. Place **d2rl-ultimate-scrapper.dll** in the active mod's **d2rloader/plugins/** folder, then start D2R through D2RLoader.
