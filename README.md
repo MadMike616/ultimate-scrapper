@@ -45,7 +45,7 @@ Entries in one recipe must match distinct cube items. Each recipe must have 1–
 - **Item type:** Use **type:** followed by a 1–4-character itemtype code. For example, **type:armo,normal** matches normal armor.
 - **Quality:** Qualities are **inferior**, **normal**, **superior**, **magic**, **set**, **rare**, **unique**, and **crafted**. If omitted, any quality matches.
 
-Itemtype rules follow the active mod's itemtype hierarchy, including **Equiv1** and **Equiv2** parent types. The plugin first reads **itemtypes.txt**, **armor.txt**, **weapons.txt**, and **misc.txt** from the active mod's **data/global/excel** folder. If that complete set is missing, it uses the base tables from **d2rloader/data/compiler/3.3.0/data/global/excel**. It does not mix active-mod and fallback tables. All plugin recipes reject items with the **ques** itemtype or a positive **quest** value in the selected tables (which also covers quest items such as the Amulet of the Viper and Staff of Kings). If neither table set can be loaded or the selected tables do not define **ques**, it disables plugin recipe matching rather than risk consuming a quest item.
+Itemtype rules follow the active mod's itemtype hierarchy, including **Equiv1** and **Equiv2** parent types. The plugin reads **itemtypes.txt**, **armor.txt**, **weapons.txt**, and **misc.txt** from the active mod's loose **data/global/excel/** folder. Setup can fill missing files using the shared **basefiles/** folder described under [Install](#install). Every recipe rejects items with the **ques** itemtype or a positive **quest** value (which also covers the Amulet of the Viper and Staff of Kings). If the four loose tables can't be loaded or **itemtypes.txt** doesn't define **ques**, the plugin disables scrapping to protect quest items.
 
 Set **inputs = [""]** to use the default recipe: exactly one Unique or Set item of any code.
 
@@ -155,14 +155,14 @@ In Separate mode, the added button uses the Repair All button widget. On first i
 
 ### Layout setup
 
-On first load, the plugin copies the active cube and stash layouts into per-install Native and Separate variants under **d2rloader/config/ultimate-scrapper-layouts/**.
+For each panel the first time its loose layout is available, the plugin creates Native and Separate variants under **d2rloader/config/ultimate-scrapper-layouts/**.
 
 - Native variants omit the plugin button; Separate variants include it.
 - The Batch scrap checkbox is added to both cube variants and both stash variants.
 - The checkbox label is nested under the checkbox, so moving the checkbox also moves the label. The label's coordinates are offsets from its parent.
 - Existing flat checkbox and label entries are migrated while preserving the label's on-screen position.
 - Other widgets, text, styles, and layout values are preserved.
-- A one-time **.ultimate-scrapper.bak** backup is kept for each active layout.
+- The original layout is backed up once under **d2rloader/plugins/basefiles-and-backups/backups/ultimate-scrapper/data/global/ui/layouts/**. If an older **.ultimate-scrapper.bak** exists beside the layout, its original contents are copied into this backup folder.
 
 The four per-install files are:
 
@@ -196,9 +196,19 @@ Ultimate Scrapper requires an authoritative local game or TCP/IP host. Remote cl
 
 ## Install
 
-Place **d2rl-ultimate-scrapper.dll** in the active mod's **d2rloader/plugins/** folder, then restart D2R through D2RLoader.
+These steps describe the current source. If you're installing a published DLL, see the README for its version under [Releases](https://github.com/MadMike616/ultimate-scrapper/releases).
 
-On first load, the plugin creates **ultimate-scrapper.toml** and the per-install layout variants if they do not already exist. The optional layout examples may need adjustments for a mod's own UI and are not installed automatically.
+1. Check the table below for the files your setup needs. Keep existing loose files in place. Use **Ladik's Casc Viewer** to extract any missing originals from the installed game into `mods/<ModName>/d2rloader/plugins/basefiles-and-backups/basefiles/`. Omit the leading **data/** from the extracted path: for example, put **data/global/excel/itemtypes.txt** in **basefiles/global/excel/itemtypes.txt**.
+2. Place **d2rl-ultimate-scrapper.dll** in the active mod's **d2rloader/plugins/** folder, then start D2R through D2RLoader.
+
+| Files | Location under `basefiles/` | When needed |
+| --- | --- | --- |
+| `itemtypes.txt`, `armor.txt`, `weapons.txt`, `misc.txt` | `global/excel/` | Required for all scrapping modes. |
+| `horadriccubelayouthd.json`, `bankexpansionlayouthd.json` | `global/ui/layouts/` | Needed for the Separate button or visible batch checkbox in the respective panel. |
+
+At startup, the plugin copies missing required files into the unpacked mod's loose **data/** folder. It keeps existing loose tables and the extracted originals. It also reads optional loose **uniqueitems.txt**, **setitems.txt**, and **cubemain.txt** to determine available Custom output qualities. Copy and backup operations use the shared mod-install lock, so they wait for other D2RLoader plugin installers using the same lock.
+
+The plugin creates **ultimate-scrapper.toml** if needed. Optional layout examples may need adjustments for a mod's own UI and are not installed automatically.
 
 ## Build
 
@@ -213,6 +223,6 @@ The `--config Release` option is required for distributed DLLs; do not release a
 
 ## Compatibility and license
 
-Ultimate Scrapper targets Windows x64, D2R 3.3.93847, and D2RLoader 1.3.1-beta (PluginSDK ABI 4). Version 0.2.3 adds base item table fallback from **d2rloader/data/compiler/3.3.0/data/global/excel** when the active mod lacks the complete required table set. Version 0.2.4 is a fresh CMake Release build of that behavior; it does not change recipe behavior or TOML settings. The plugin continues to block items with the **ques** itemtype or a positive quest value in the selected tables from every plugin recipe and uses PluginSDK 0.4.0.
+Ultimate Scrapper targets Windows x64 and D2RLoader 1.3.1-beta (PluginSDK 0.4.0, ABI 4). It uses loose item tables and can fill in missing files from the mod's shared **basefiles/** folder.
 
 The project is licensed under the MIT License. See **LICENSE** and **THIRD_PARTY_NOTICES.md** for third-party notices for TOML++ and the D2RLoader PluginSDK.

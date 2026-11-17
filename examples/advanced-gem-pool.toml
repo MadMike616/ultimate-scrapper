@@ -9,8 +9,10 @@
 # Each string is an item code, "any", or "type:<code>", optionally followed
 # by a comma and quality. Item codes use 3 or 4 characters; itemtype codes use
 # 1 through 4 characters from ItemTypes.txt and include Equiv1/2 parent types.
-# Type rules need itemtypes.txt, armor.txt, weapons.txt, and misc.txt in the
-# active mod's data/global/excel folder. Supported qualities: inferior, normal,
+# All scrapping needs itemtypes.txt, armor.txt, weapons.txt, and misc.txt in the
+# active mod's loose data/global/excel folder. Missing files can be copied from
+# d2rloader/plugins/basefiles-and-backups/basefiles/global/excel.
+# Supported qualities: inferior, normal,
 # superior, magic, set, rare, unique, crafted. No quality means any quality is accepted.
 # The single-empty-string value inputs = [""] means one Unique or Set item.
 # Use code "any" to accept any item code, optionally with a quality:
