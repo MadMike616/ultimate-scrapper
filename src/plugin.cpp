@@ -1,3 +1,4 @@
+#include "install_token.hpp"
 #include <D2RLPlugin/api.h>
 
 #include "default_config.hpp"
@@ -199,7 +200,7 @@ constexpr D2RL::PluginInfo Info{
     .abiVersion = D2RL_PLUGIN_ABI_VERSION,
     .id = PluginId,
     .name = "Ultimate Scrapper",
-    .version = "1.2.4",
+    .version = "1.2.5",
     .author = "MadMike",
     .description = "Transmutes configured input items into runes or configurable custom items.",
     .flags = D2RL::PluginFlags::Client,
@@ -1736,15 +1737,22 @@ auto ApplyLayoutFile(const fs::path& path, const fs::path& backupPath,
     if (path.empty()) return false;
     try {
         LayoutVariantPaths variantPaths;
-        if (!EnsureOriginalLayoutBackup(path, backupPath)
-                || !PrepareLayoutVariants(path, variantPaths, cubeLayout,
-                    showBatchCheckboxes, addBatchCheckboxes)) {
-            return false;
-        }
+        const auto section=cubeLayout ? "installation.cube_layout" : "installation.stash_layout";
+        const bool complete=InstallToken::Complete(*Context,section);
+        const bool needsBatch=addBatchCheckboxes && InstallToken::Get(*Context,"batch_controls",section)!=std::optional<std::string>("true");
+        const bool setup=!complete || needsBatch;
+        if (setup) {
+            if (!EnsureOriginalLayoutBackup(path,backupPath)
+                    || !PrepareLayoutVariants(path,variantPaths,cubeLayout,showBatchCheckboxes,addBatchCheckboxes))
+                return false;
+        } else variantPaths=GetLayoutVariantPaths(path);
         const auto& selectedPath = nativeButtonMode
             ? variantPaths.native : variantPaths.separate;
         auto selectedJson = ReadTextFile(selectedPath);
         if (!selectedJson || selectedJson->empty()) return false;
+        // Runtime visibility and button-mode selection remain independent of setup.
+        if (!SyncExistingBatchCheckbox(*selectedJson,cubeLayout)
+                || !SetBatchCheckboxVisibility(*selectedJson,showBatchCheckboxes)) return false;
         if (!showBatchCheckboxes
                 && (!RemoveNamedJsonObject(*selectedJson,
                         "ultimate_scrapper_batch_toggle")
@@ -1753,8 +1761,9 @@ auto ApplyLayoutFile(const fs::path& path, const fs::path& backupPath,
             return false;
         }
         const auto activeJson = ReadTextFile(path);
-        if (activeJson && *activeJson == *selectedJson) return true;
-        return StoreTextAtomically(path, *selectedJson);
+        if ((!activeJson || *activeJson!=*selectedJson) && !StoreTextAtomically(path,*selectedJson)) return false;
+        if (setup) InstallToken::Commit(*Context,{{"batch_controls",addBatchCheckboxes ? "true" : "false"}},section);
+        return true;
     } catch (...) {
         return false;
     }
@@ -3125,8 +3134,13 @@ auto InitializeStartupFiles(const D2RL::PluginContext* context) -> bool {
     std::optional<ModFilePaths> paths;
     try {
         paths = ResolveModFilePaths();
-        if (paths && PrepareLooseItemTables(*paths) != 0) {
-            context->LogInfo("UltimateScrapper: copied missing item tables from basefiles into the active mod's loose data.");
+        if (paths && !InstallToken::Complete(*context,"installation.tables")) {
+            if (PrepareLooseItemTables(*paths)!=0)
+                context->LogInfo("UltimateScrapper: copied missing item tables from basefiles into the active mod's loose data.");
+            bool ready=true;
+            for (const auto* name:{L"itemtypes.txt",L"armor.txt",L"weapons.txt",L"misc.txt"})
+                ready=ready && fs::is_regular_file(paths->loose(fs::path(L"global/excel")/name));
+            if (ready) InstallToken::Commit(*context,{},"installation.tables",DefaultConfig);
         }
     } catch (...) {
         context->LogWarn("UltimateScrapper: could not prepare missing loose item tables; check the active mod and basefiles permissions.");
@@ -3207,11 +3221,11 @@ auto Initialize(const D2RL::PluginContext* context) -> bool {
     }
     Active.store(true, std::memory_order_release);
     if (Config.activeOutputMode == OutputMode::Runes) {
-        context->LogInfo("UltimateScrapper 1.2.4 is ready in Runes mode.");
+        context->LogInfo("UltimateScrapper 1.2.5 is ready in Runes mode.");
     } else if (Config.activeOutputMode == OutputMode::Custom) {
-        context->LogInfo("UltimateScrapper 1.2.4 is ready in Custom mode.");
+        context->LogInfo("UltimateScrapper 1.2.5 is ready in Custom mode.");
     } else {
-        context->LogInfo("UltimateScrapper 1.2.4 is ready in Both mode; each transmute chooses Runes or Custom with equal probability.");
+        context->LogInfo("UltimateScrapper 1.2.5 is ready in Both mode; each transmute chooses Runes or Custom with equal probability.");
     }
     if (Config.transmuteButtonMode == TransmuteButtonMode::Native) {
         context->LogInfo("UltimateScrapper: Native button mode is active; configured plugin recipes take priority on Convert, and unmatched contents pass to D2R.");

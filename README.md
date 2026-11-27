@@ -226,3 +226,12 @@ The `--config Release` option is required for distributed DLLs; do not release a
 Ultimate Scrapper targets Windows x64 and D2RLoader 1.3.1-beta (PluginSDK 0.4.0, ABI 4). It uses loose item tables and can fill in missing files from the mod's shared **basefiles/** folder.
 
 The project is licensed under the MIT License. See **LICENSE** and **THIRD_PARTY_NOTICES.md** for third-party notices for TOML++ and the D2RLoader PluginSDK.
+
+
+## Installation completion
+
+After successful first-run setup, the plugin records a completion token in its TOML configuration. Later launches skip that completed setup and preserve existing files and settings. Failed setup remains retryable.
+
+Completion is recorded separately in `[installation.tables]`, `[installation.cube_layout]`, and `[installation.stash_layout]`. Changing the button mode still updates the relevant layout when needed.
+
+To rerun setup intentionally, close the game and set `complete = false` in the relevant token section (`[installation.tables]` by default).
